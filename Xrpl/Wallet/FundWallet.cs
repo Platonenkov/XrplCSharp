@@ -15,6 +15,8 @@ using Xrpl.AddressCodec;
 using Xrpl.Client;
 using Xrpl.Client.Exceptions;
 using Xrpl.Client.Json;
+using Xrpl.Models.Methods;
+using Xrpl.Sugar;
 
 // https://github.com/XRPLF/xrpl.js/blob/main/packages/xrpl/src/Wallet/fundWallet.ts
 
@@ -47,9 +49,6 @@ namespace Xrpl.Wallet
             [JsonPropertyName("classicAddress")]
             public string ClassicAddress { get; set; }
 
-            [JsonPropertyName("secret")]
-            public string Secret { get; set; }
-
         }
 
         public class FaucetWallet
@@ -60,8 +59,12 @@ namespace Xrpl.Wallet
             [JsonPropertyName("amount")]
             public double Amount { get; set; }
 
-            [JsonPropertyName("balance")]
-            public double Balance { get; set; }
+            /// <summary>
+            /// The payment the faucet says it sent. This is the whole answer to "did the faucet
+            /// pay?", so it is preferred over watching a balance whenever the faucet supplies it.
+            /// </summary>
+            [JsonPropertyName("transactionHash")]
+            public string TransactionHash { get; set; }
 
         }
 
@@ -101,15 +104,7 @@ namespace Xrpl.Wallet
             // Generate a new Wallet if no existing Wallet is provided or its address is invalid to fund
             XrplWallet walletToFund = (wallet != null && XrplCodec.IsValidClassicAddress(wallet.ClassicAddress)) ? wallet : XrplWallet.Generate();
 
-            double startingBalance = 0;
-            try
-            {
-                startingBalance = Convert.ToDouble(await client.GetXrpBalance(walletToFund.ClassicAddress, cancellationToken).ConfigureAwait(false));
-            }
-            catch (Exception err) when (!IsCallerCancellation(err, cancellationToken))
-            {
-                /* startingBalance remains '0': the account is usually not on the ledger yet */
-            }
+            Baseline startingBalance = await ReadBaselineAsync(client, walletToFund.ClassicAddress, cancellationToken).ConfigureAwait(false);
 
             // Create the POST request body
 
@@ -171,10 +166,52 @@ namespace Xrpl.Wallet
             return err is HttpRequestException || err is IOException;
         }
 
+        /// <summary>
+        /// The balance an account held before the faucet was asked, and whether that is a
+        /// measurement. An account that is not on the ledger holds nothing, and zero is the
+        /// answer; a read that failed for any other reason leaves no answer at all, and treating
+        /// the zero as one lets a balance the account already had stand in for a payment that
+        /// never arrived.
+        /// </summary>
+        internal readonly struct Baseline
+        {
+            private Baseline(double value, bool known)
+            {
+                Value = value;
+                Known = known;
+            }
+
+            public double Value { get; }
+
+            public bool Known { get; }
+
+            public static Baseline Of(double value) => new Baseline(value, true);
+
+            public static readonly Baseline Unknown = new Baseline(0, false);
+        }
+
+        internal static async Task<Baseline> ReadBaselineAsync(
+            IXrplClient client, string address, CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                return Baseline.Of(Convert.ToDouble(
+                    await client.GetXrpBalance(address, cancellationToken).ConfigureAwait(false)));
+            }
+            catch (Exception err) when (!IsCallerCancellation(err, cancellationToken))
+            {
+                // The ordinary case: the account is not on the ledger until the faucet pays, and
+                // the node says so. That is a balance of nothing, and it is a measurement.
+                return err.Classify().Category == XrplErrorCategory.NotFound
+                    ? Baseline.Of(0)
+                    : Baseline.Unknown;
+            }
+        }
+
         private static async Task<Funded> ReturnPromise(
               Dictionary<string, object> options,
               IXrplClient client,
-              double startingBalance,
+              Baseline startingBalance,
               XrplWallet walletToFund,
               string postBody,
               CancellationToken cancellationToken
@@ -248,7 +285,7 @@ namespace Xrpl.Wallet
             HttpResponseMessage response,
             byte[] chunks,
             IXrplClient client,
-            double startingBalance,
+            Baseline startingBalance,
             XrplWallet walletToFund,
             CancellationToken cancellationToken
         )
@@ -306,7 +343,7 @@ namespace Xrpl.Wallet
         /// each way of being wrong is named here rather than surfacing further along as a
         /// <see cref="NullReferenceException"/> with nothing to say about the faucet.
         /// </summary>
-        internal static string ReadFaucetAddress(string body)
+        internal static FaucetWallet ReadFaucetResponse(string body)
         {
             FaucetWallet faucetWallet;
             try
@@ -318,24 +355,130 @@ namespace Xrpl.Wallet
                 throw new XRPLFaucetException($"The faucet response is not JSON this can read: {err.Message}", err);
             }
 
-            string classicAddress = faucetWallet?.Account?.ClassicAddress;
-            if (string.IsNullOrEmpty(classicAddress))
+            if (string.IsNullOrEmpty(faucetWallet?.Account?.ClassicAddress))
             {
                 throw new XRPLFaucetException($"The faucet response carries no account address: {Redact(body)}");
             }
 
-            return classicAddress;
+            return faucetWallet;
         }
+
+        /// <summary>The address the faucet says it funded.</summary>
+        internal static string ReadFaucetAddress(string body) => ReadFaucetResponse(body).Account.ClassicAddress;
+
+        /// <summary>
+        /// Waits for the payment the faucet named to be validated, and refuses anything but a
+        /// <c>tes</c> result. A transaction the ledger has not heard of yet is the ordinary state
+        /// of this wait - the faucet answers before its payment is validated - so
+        /// <c>txnNotFound</c> is a reason to look again rather than a failure.
+        /// </summary>
+        internal static async Task<TransactionSummary> AwaitFaucetPaymentAsync(
+            IXrplClient client,
+            string transactionHash,
+            string fundedAddress,
+            CancellationToken cancellationToken = default,
+            int attempts = MAX_ATTEMPTS,
+            int intervalSeconds = INTERVAL_SECONDS)
+        {
+            Exception lastLookupFailure = null;
+
+            for (int attempt = 0; attempt < attempts; attempt++)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(intervalSeconds), cancellationToken).ConfigureAwait(false);
+
+                TransactionSummary payment;
+                try
+                {
+                    payment = await client.TxV2(new TxRequest(transactionHash) { ApiVersion = 2 }, cancellationToken).Typed();
+                }
+                catch (Exception err) when (IsRetryableReadFailure(err, cancellationToken))
+                {
+                    lastLookupFailure = err;
+                    continue;
+                }
+
+                if (payment?.Validated != true)
+                {
+                    // Seen but not validated: nothing failed, the ledger has not closed on it
+                    lastLookupFailure = null;
+                    continue;
+                }
+
+                string result = payment.Meta?.TransactionResult;
+                if (result != null && !result.StartsWith("tes", StringComparison.Ordinal))
+                {
+                    throw new XRPLFaucetException(
+                        $"The faucet's payment {transactionHash} to {fundedAddress} was validated with {result}");
+                }
+
+                return payment;
+            }
+
+            throw new XRPLFaucetException(
+                $"The faucet accepted the request for {fundedAddress} and named payment {transactionHash}, which was not validated within {intervalSeconds} * {attempts} seconds",
+                lastLookupFailure);
+        }
+
+        /// <summary>
+        /// The balance to report once the faucet's payment has validated. There is no comparison
+        /// left to make at this point - the payment is a fact - so a read that fails is only a
+        /// missing number, and it is reported as that rather than as a funding failure.
+        /// </summary>
+        private static async Task<double> ReadFundedBalanceAsync(
+            IXrplClient client,
+            string address,
+            string transactionHash,
+            CancellationToken cancellationToken)
+        {
+            Exception lastReadFailure = null;
+
+            for (int attempt = 0; attempt < BALANCE_READ_ATTEMPTS; attempt++)
+            {
+                try
+                {
+                    return Convert.ToDouble(await client.GetXrpBalance(address, cancellationToken).ConfigureAwait(false));
+                }
+                catch (Exception err) when (IsRetryableReadFailure(err, cancellationToken))
+                {
+                    lastReadFailure = err;
+                    await Task.Delay(TimeSpan.FromSeconds(INTERVAL_SECONDS), cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            throw new XRPLFaucetException(
+                $"The faucet's payment {transactionHash} to {address} was validated, but the balance could not be read afterwards",
+                lastReadFailure);
+        }
+
+        private const int BALANCE_READ_ATTEMPTS = 3;
 
         private static async Task<Funded> ProcessSuccessfulResponse(
               IXrplClient client,
               string body,
-              double startingBalance,
+              Baseline startingBalance,
               XrplWallet walletToFund,
               CancellationToken cancellationToken
         )
         {
-            string fundedAddress = ReadFaucetAddress(body);
+            FaucetWallet faucet = ReadFaucetResponse(body);
+            string fundedAddress = faucet.Account.ClassicAddress;
+
+            if (!string.IsNullOrEmpty(faucet.TransactionHash))
+            {
+                // The faucet named the payment it sent, which answers the question outright.
+                // Nothing here compares balances, so a balance the account already held cannot
+                // stand in for a payment that never arrived.
+                await AwaitFaucetPaymentAsync(client, faucet.TransactionHash, fundedAddress, cancellationToken).ConfigureAwait(false);
+                return new Funded(walletToFund, await ReadFundedBalanceAsync(client, walletToFund.ClassicAddress, faucet.TransactionHash, cancellationToken).ConfigureAwait(false));
+            }
+
+            if (!startingBalance.Known)
+            {
+                // Without the payment named and without a baseline, a rise cannot be told from a
+                // balance that was always there. Saying so beats guessing in the caller's favour.
+                throw new XRPLFaucetException(
+                    $"The faucet at this host does not name the payment it sent, and the balance of {walletToFund.ClassicAddress} could not be read before the request, so there is nothing to tell a payment from the funds the account already held");
+            }
 
             PollOutcome poll;
             try
@@ -344,7 +487,7 @@ namespace Xrpl.Wallet
                 poll = await PollForFundedBalance(
                     client,
                     walletToFund.ClassicAddress,
-                    startingBalance,
+                    startingBalance.Value,
                     cancellationToken
                 ).ConfigureAwait(false);
             }
@@ -356,7 +499,7 @@ namespace Xrpl.Wallet
                     $"Could not read the balance of {walletToFund.ClassicAddress} while waiting for the faucet: {err.Message}", err);
             }
 
-            if (poll.Balance <= startingBalance)
+            if (poll.Balance <= startingBalance.Value)
             {
                 // One sentence, and it is the one that is always true: the balance did not rise.
                 // What the last failed read was cannot pick the wording - an account the faucet
@@ -364,7 +507,7 @@ namespace Xrpl.Wallet
                 // exactly the ordinary case - but it is the only account of a client-side outage,
                 // so it rides along as the cause.
                 throw new XRPLFaucetException(
-                    $"The faucet accepted the request for {fundedAddress}, but the balance of {walletToFund.ClassicAddress} did not rise above {startingBalance} within {INTERVAL_SECONDS} * {MAX_ATTEMPTS} seconds",
+                    $"The faucet accepted the request for {fundedAddress}, but the balance of {walletToFund.ClassicAddress} did not rise above {startingBalance.Value} within {INTERVAL_SECONDS} * {MAX_ATTEMPTS} seconds",
                     poll.LastReadFailure);
             }
 
