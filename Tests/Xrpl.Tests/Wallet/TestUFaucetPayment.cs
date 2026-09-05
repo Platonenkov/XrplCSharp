@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -46,11 +47,20 @@ namespace Xrpl.Tests.Wallet.Tests
             }
         }
 
-        private static TransactionSummary Payment(bool validated, string result) => new TransactionSummary
+        private static TransactionSummary Payment(bool validated, string result, string destination = "rFunded")
         {
-            Validated = validated,
-            Meta = result is null ? null : new Meta { TransactionResult = result },
-        };
+            TransactionSummary summary = new TransactionSummary
+            {
+                Validated = validated,
+                Meta = result is null ? null : new Meta { TransactionResult = result },
+            };
+            // Transaction is get-only on the model, so the destination is set through the same
+            // deserialization the node's answer goes through
+            typeof(TransactionSummary)
+                .GetField("_transaction", BindingFlags.Instance | BindingFlags.NonPublic)
+                .SetValue(summary, destination is null ? null : new PaymentResponse { Destination = destination });
+            return summary;
+        }
 
         private static Func<TransactionSummary> Throws(Exception err) => () => throw err;
 
@@ -89,7 +99,7 @@ namespace Xrpl.Tests.Wallet.Tests
         public async Task Payment_SeenButNotValidated_IsWaitedFor()
         {
             ScriptedTxClient client = new ScriptedTxClient(
-                () => Payment(false, null),
+                () => Payment(false, null, destination: null),
                 () => Payment(true, "tesSUCCESS"));
 
             await AwaitAsync(client);
@@ -110,6 +120,32 @@ namespace Xrpl.Tests.Wallet.Tests
 
             StringAssert.Contains(ex.Message, "tecUNFUNDED_PAYMENT");
             StringAssert.Contains(ex.Message, "ABC123");
+        }
+
+        /// <summary>
+        /// A hash is the faucet's claim about what it did. Any validated transaction on the
+        /// ledger satisfies a lookup, including one that pays somebody else entirely.
+        /// </summary>
+        [TestMethod]
+        public async Task Payment_ValidatedButPayingSomebodyElse_IsRefused()
+        {
+            ScriptedTxClient client = new ScriptedTxClient(() => Payment(true, "tesSUCCESS", destination: "rSomebodyElse"));
+
+            XRPLFaucetException ex = await Assert.ThrowsExactlyAsync<XRPLFaucetException>(() => AwaitAsync(client));
+
+            StringAssert.Contains(ex.Message, "rSomebodyElse");
+            StringAssert.Contains(ex.Message, "rFunded");
+        }
+
+        /// <summary>A validated transaction has a result code; without one nothing here says it succeeded.</summary>
+        [TestMethod]
+        public async Task Payment_ValidatedWithNoResultCode_IsRefused()
+        {
+            ScriptedTxClient client = new ScriptedTxClient(() => Payment(true, null));
+
+            XRPLFaucetException ex = await Assert.ThrowsExactlyAsync<XRPLFaucetException>(() => AwaitAsync(client));
+
+            StringAssert.Contains(ex.Message, "no result code");
         }
 
         [TestMethod]

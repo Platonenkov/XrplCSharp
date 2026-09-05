@@ -16,6 +16,7 @@ using Xrpl.Client;
 using Xrpl.Client.Exceptions;
 using Xrpl.Client.Json;
 using Xrpl.Models.Methods;
+using Xrpl.Models.Transactions;
 using Xrpl.Sugar;
 
 // https://github.com/XRPLF/xrpl.js/blob/main/packages/xrpl/src/Wallet/fundWallet.ts
@@ -375,7 +376,7 @@ namespace Xrpl.Wallet
         internal static async Task<TransactionSummary> AwaitFaucetPaymentAsync(
             IXrplClient client,
             string transactionHash,
-            string fundedAddress,
+            string expectedDestination,
             CancellationToken cancellationToken = default,
             int attempts = MAX_ATTEMPTS,
             int intervalSeconds = INTERVAL_SECONDS)
@@ -405,17 +406,29 @@ namespace Xrpl.Wallet
                 }
 
                 string result = payment.Meta?.TransactionResult;
-                if (result != null && !result.StartsWith("tes", StringComparison.Ordinal))
+                if (string.IsNullOrEmpty(result) || !result.StartsWith("tes", StringComparison.Ordinal))
+                {
+                    // No result code is not a pass. A validated transaction has one, and without
+                    // it there is nothing here that says the payment succeeded
+                    throw new XRPLFaucetException(
+                        $"The faucet's payment {transactionHash} was validated with {result ?? "no result code"}");
+                }
+
+                // The hash is the faucet's claim about what it did, and a claim is worth what it
+                // can be checked against: any validated transaction on the ledger would satisfy a
+                // lookup, including one that pays somebody else
+                string destination = (payment.Transaction as IDestination)?.Destination;
+                if (!string.Equals(destination, expectedDestination, StringComparison.Ordinal))
                 {
                     throw new XRPLFaucetException(
-                        $"The faucet's payment {transactionHash} to {fundedAddress} was validated with {result}");
+                        $"The faucet named payment {transactionHash}, which is validated but pays {destination ?? "an account this cannot read"} rather than {expectedDestination}");
                 }
 
                 return payment;
             }
 
             throw new XRPLFaucetException(
-                $"The faucet accepted the request for {fundedAddress} and named payment {transactionHash}, which was not validated within {intervalSeconds} * {attempts} seconds",
+                $"The faucet accepted the request for {expectedDestination} and named payment {transactionHash}, which was not validated within {intervalSeconds} * {attempts} seconds",
                 lastLookupFailure);
         }
 
@@ -463,12 +476,20 @@ namespace Xrpl.Wallet
             FaucetWallet faucet = ReadFaucetResponse(body);
             string fundedAddress = faucet.Account.ClassicAddress;
 
+            if (!string.Equals(fundedAddress, walletToFund.ClassicAddress, StringComparison.Ordinal))
+            {
+                // Every request names its destination, so the answer is about that account or it
+                // is about nothing this call can use
+                throw new XRPLFaucetException(
+                    $"The faucet answered about {fundedAddress}, which is not the {walletToFund.ClassicAddress} it was asked to fund");
+            }
+
             if (!string.IsNullOrEmpty(faucet.TransactionHash))
             {
                 // The faucet named the payment it sent, which answers the question outright.
                 // Nothing here compares balances, so a balance the account already held cannot
                 // stand in for a payment that never arrived.
-                await AwaitFaucetPaymentAsync(client, faucet.TransactionHash, fundedAddress, cancellationToken).ConfigureAwait(false);
+                await AwaitFaucetPaymentAsync(client, faucet.TransactionHash, walletToFund.ClassicAddress, cancellationToken).ConfigureAwait(false);
                 return new Funded(walletToFund, await ReadFundedBalanceAsync(client, walletToFund.ClassicAddress, faucet.TransactionHash, cancellationToken).ConfigureAwait(false));
             }
 
