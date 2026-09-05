@@ -784,7 +784,9 @@ internal class FeeTestClient : IXrplClient
     public Task<Submit> Submit(Dictionary<string, object> tx, XrplWallet wallet, bool autoFill = true, bool failHard = false, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     public Task<Submit> Submit(ITransactionRequest tx, XrplWallet wallet, bool autoFill = true, bool failHard = false, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     public Task<XrplResponse<TransactionResponse>> TxV1(TxRequest request, CancellationToken cancellationToken = default) => throw new NotSupportedException();
-    public Task<XrplResponse<TransactionSummary>> TxV2(TxRequest request, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    // virtual for the same reason GetXrpBalance is: a test that needs a transaction back can
+    // answer one without a second 180-line substitute
+    public virtual Task<XrplResponse<TransactionSummary>> TxV2(TxRequest request, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     public Task<XrplResponse<BookOffers>> BookOffers(BookOffersRequest request, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     public Task<XrplResponse<DepositAuthorized>> DepositAuthorized(DepositAuthorizedRequest request, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     public Task<XrplResponse<NFTBuyOffers>> NFTBuyOffers(NFTBuyOffersRequest request, CancellationToken cancellationToken = default) => throw new NotSupportedException();
