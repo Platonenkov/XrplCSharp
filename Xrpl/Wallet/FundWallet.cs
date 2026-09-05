@@ -317,10 +317,15 @@ namespace Xrpl.Wallet
         }
 
         /// <summary>
-        /// What may be repeated back from a faucet body. A successful response carries the funded
-        /// wallet's seed in <c>account.secret</c>, and an exception message is the one thing a
+        /// What may be repeated back from a faucet body. An exception message is the one thing a
         /// caller is certain to log, so the value of anything that names a secret is masked and
         /// the rest is capped. Quoting the body is still worth it: a rate limit says so in it.
+        /// <para>
+        /// The faucets these hosts run return a seed only when no <c>destination</c> is sent,
+        /// which this library always sends - so nothing here is known to leak today, and the mask
+        /// is for the host that does. <c>xAddress</c> was on this list and is not: it is the
+        /// X-address form of the funded account, and masking it cost diagnostics for nothing.
+        /// </para>
         /// </summary>
         internal static string Redact(string body)
         {
@@ -336,7 +341,7 @@ namespace Xrpl.Wallet
         private const int MaxQuotedBody = 512;
 
         private static readonly Regex SecretValue = new Regex(
-            "(\"(?:secret|seed|master_seed|master_seed_hex|private_key|passphrase|xAddress)\"\\s*:\\s*)\"[^\"]*\"",
+            "(\"(?:secret|seed|master_seed|master_seed_hex|private_key|passphrase)\"\\s*:\\s*)\"[^\"]*\"",
             RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         /// <summary>
