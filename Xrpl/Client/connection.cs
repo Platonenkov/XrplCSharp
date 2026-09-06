@@ -2251,13 +2251,7 @@ public class Connection
         // connection: it must not count towards giving up, and the give-up branch - RejectAll and
         // Disconnect() - would take the live connection down for a callback that belongs to a dead one.
         // Read-only here; the clear under the same lock happens below, once this path owns the teardown.
-        bool isCurrentSocket;
-        lock (_disconnectLock)
-        {
-            isCurrentSocket = ReferenceEquals(ws, failedSocket);
-        }
-
-        if (!isCurrentSocket)
+        if (!IsCurrentSocket(failedSocket))
         {
             failedSocket.Cancel();
             failedSocket.Disconnect();
@@ -2282,6 +2276,16 @@ public class Connection
                 message:
                 $"OnConnected handler failed {failures} time(s) in a row: {error.Message}. Giving up after {config.MaxReconnectAttempts} attempts. Call Connect() to retry.",
                 ConnectionCloseSeverity.Error);
+
+            // The notification above ran consumer code. A handler that answered "gave up" with a
+            // ChangeServer has already taken this socket out of ws and is opening another; the
+            // teardown below would then reject that connection's requests and close its socket.
+            if (!IsCurrentSocket(failedSocket))
+            {
+                failedSocket.Cancel();
+                failedSocket.Disconnect();
+                return;
+            }
 
             // Rejected here, before Disconnect(), and with the reason that is actually true. The
             // requests in flight are being stopped because this client gave up connecting, not
@@ -2354,6 +2358,18 @@ public class Connection
         // that means connect -> handler failure -> teardown forever at a constant 2s, a sustained
         // connection load on a node that accepts TCP but cannot serve requests yet.
         RestartReconnectLoop(initialAttempts: failures);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="socket"/> is the one installed as the connection right now. Read
+    /// under <c>_disconnectLock</c>, the lock every retirement path clears <c>ws</c> under.
+    /// </summary>
+    private bool IsCurrentSocket(WebSocketClient socket)
+    {
+        lock (_disconnectLock)
+        {
+            return ReferenceEquals(ws, socket);
+        }
     }
 
     /// <summary>
