@@ -2230,10 +2230,6 @@ public class Connection
     /// <param name="error">The exception thrown by the handler.</param>
     private async Task OnConnectHandlerFailedAsync(WebSocketClient failedSocket, Exception error)
     {
-        int failures = Interlocked.Increment(ref _connectHandlerFailures);
-
-        Debug.WriteLine($"{DateTime.Now}OnConnected handler failed ({failures}): {error.Message}");
-
         var errorHandler = OnError;
         if (errorHandler is not null)
         {
@@ -2248,6 +2244,29 @@ public class Connection
                 Debug.WriteLine($"{DateTime.Now}OnError handler threw while reporting OnConnected failure: {notifyError.Message}");
             }
         }
+
+        // Ownership first, before anything below counts or tears down. WebSocketClient.Connect invokes
+        // its OnConnect callback without awaiting it, so this can run after a newer socket has replaced
+        // the one whose handler failed. That socket's failure is not a failure of the current
+        // connection: it must not count towards giving up, and the give-up branch - RejectAll and
+        // Disconnect() - would take the live connection down for a callback that belongs to a dead one.
+        // Read-only here; the clear under the same lock happens below, once this path owns the teardown.
+        bool isCurrentSocket;
+        lock (_disconnectLock)
+        {
+            isCurrentSocket = ReferenceEquals(ws, failedSocket);
+        }
+
+        if (!isCurrentSocket)
+        {
+            failedSocket.Cancel();
+            failedSocket.Disconnect();
+            return;
+        }
+
+        int failures = Interlocked.Increment(ref _connectHandlerFailures);
+
+        Debug.WriteLine($"{DateTime.Now}OnConnected handler failed ({failures}): {error.Message}");
 
         bool giveUp = config.StopAfterMaxAttempts && failures >= config.MaxReconnectAttempts;
         if (giveUp)
@@ -2297,9 +2316,10 @@ public class Connection
 
         if (!wasCurrentSocket)
         {
-            // A newer connection already replaced this socket, and owns the ping timer, the pending
-            // requests, the message processor and the reconnect state. None of that is this
-            // callback's to touch: it closes the socket its handler ran for and steps aside.
+            // Replaced between the ownership check above and here - the OnError notification and the
+            // give-up branch in between hand control to consumer code. A newer connection owns the
+            // ping timer, the pending requests, the message processor and the reconnect state now;
+            // this callback closes the socket its handler ran for and steps aside.
             failedSocket.Cancel();
             failedSocket.Disconnect();
             return;
