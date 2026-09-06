@@ -1496,6 +1496,21 @@ public class Connection
 
         if (socketToClose == null || tcs == null)
         {
+            // Nothing here to close - but another DisconnectAndWaitAsync may be mid-way, having
+            // taken the socket already. This call promised to return once the socket is gone, so
+            // it waits on that one's completion source rather than reporting a disconnect that
+            // has not finished.
+            TaskCompletionSource<bool>? inProgress;
+            lock (_disconnectLock)
+            {
+                inProgress = _disconnectTcs;
+            }
+
+            if (inProgress is { Task.IsCompleted: false })
+            {
+                await Task.WhenAny(inProgress.Task, Task.Delay(timeout, cancellationToken));
+            }
+
             SetConnectionState(XrpConnectionState.Disconnected, message: "Already disconnected.");
             return;
         }
@@ -2113,6 +2128,17 @@ public class Connection
             return;
         }
 
+        // A user Disconnect() that landed while this socket was still connecting has marked it and
+        // is closing it. Installing it here would undo the disconnect: ws restored, the
+        // intentional-disconnect tracking cleared below, and the close that follows read as a
+        // network drop that starts a reconnect loop. The session check above does not cover this -
+        // Disconnect() does not retire the session, because OnceClose is what announces a user
+        // disconnect - so the socket's own marks are the signal.
+        if (_permanentlyDisconnected || IsSocketUserInitiated(connectedSocket))
+        {
+            return;
+        }
+
         // Verify the connected socket matches current ws, or update ws if it was cleared
         if (ws == null)
         {
@@ -2254,14 +2280,6 @@ public class Connection
             return;
         }
 
-        SetConnectionState(
-            XrpConnectionState.RestoringConnection,
-            message: $"OnConnected handler failed: {error.Message}. Reconnecting...",
-            ConnectionCloseSeverity.Warning,
-            reconnect: BuildReconnectInfo(failures));
-
-        StopPingTimerSync();
-
         // Always tear down the socket the handler actually ran for. WebSocketClient.Connect invokes its
         // OnConnect callback without awaiting it, so the connect lock can be released while this method is
         // still running: by now `ws` may already point at a newer socket that must not be touched.
@@ -2277,6 +2295,23 @@ public class Connection
             }
         }
 
+        if (!wasCurrentSocket)
+        {
+            // A newer connection already replaced this socket, and owns the ping timer, the pending
+            // requests, the message processor and the reconnect state. None of that is this
+            // callback's to touch: it closes the socket its handler ran for and steps aside.
+            failedSocket.Cancel();
+            failedSocket.Disconnect();
+            return;
+        }
+
+        SetConnectionState(
+            XrpConnectionState.RestoringConnection,
+            message: $"OnConnected handler failed: {error.Message}. Reconnecting...",
+            ConnectionCloseSeverity.Warning,
+            reconnect: BuildReconnectInfo(failures));
+
+        StopPingTimerSync();
         requestManager.RejectAllWithCancellation();
         await StopMessageProcessorAsync();
         await WaitForPingToFinishAsync();
@@ -2285,12 +2320,6 @@ public class Connection
         // close so the standard reconnect path runs instead of the "closed permanently" branch.
         failedSocket.Cancel();
         failedSocket.Disconnect();
-
-        if (!wasCurrentSocket)
-        {
-            // A newer connection already replaced this socket - it owns the reconnect state now.
-            return;
-        }
 
         // Take ownership of the reconnect state instead of asking "is a loop already running?".
         // This method can run inside the reconnect loop's own attempt: that loop breaks as soon as the
