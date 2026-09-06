@@ -103,6 +103,23 @@ namespace Xrpl.Tests.Wallet.Tests
             StringAssert.Contains(redacted, "rKeepMe", "an address is not a secret and stays readable");
         }
 
+        /// <summary>
+        /// An address is not a secret. <c>xAddress</c> was on the mask list on the assumption it
+        /// might be one; the faucets return it as the X-address form of the funded account, so
+        /// masking it removed a diagnostic and protected nothing.
+        /// </summary>
+        [TestMethod]
+        public void Redact_LeavesTheAddressesReadable()
+        {
+            string body = @"{""account"": {""xAddress"": ""T7dRN2ktZGYSTgFdCzYYVbdKPKTvXbGgfe1MJfBLnkYbUQK"", ""classicAddress"": ""rGmaiHAmQ4Kmoc9zAdKQ4rr8YLQGDRXWmE""}, ""seed"": ""sEdSECRET""}";
+
+            string redacted = WalletSugar.Redact(body);
+
+            StringAssert.Contains(redacted, "T7dRN2ktZGYSTgFdCzYYVbdKPKTvXbGgfe1MJfBLnkYbUQK");
+            StringAssert.Contains(redacted, "rGmaiHAmQ4Kmoc9zAdKQ4rr8YLQGDRXWmE");
+            Assert.IsFalse(redacted.Contains("sEdSECRET"), "the seed still goes");
+        }
+
         [TestMethod]
         public void Redact_CapsALongBodySoAMessageStaysAMessage()
         {
