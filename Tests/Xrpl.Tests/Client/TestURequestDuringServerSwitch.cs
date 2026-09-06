@@ -231,22 +231,28 @@ namespace Xrpl.Tests
                 $"{AcceptableBound.TotalSeconds:F0}s. It was written to the retired socket and nothing will " +
                 $"complete it before RequestTimeout ({RequestTimeout.TotalSeconds:F0}s) expires.");
 
-            // Either outcome is correct: sent on the new connection, or refused outright. What is
-            // not correct is waiting out RequestTimeout.
+            // Either outcome is correct: sent on the new connection (it completed within the bound,
+            // which is all a success has to show), or refused outright. What is not correct is
+            // waiting out RequestTimeout. A failure is captured first and judged afterwards, so an
+            // assertion failure is reported as itself rather than caught here.
+            Exception failure = null;
             try
             {
-                XrplResponse<Dictionary<string, object>> response = await followUp;
-                Assert.IsNotNull(response, "A completed follow-up must carry a response.");
-            }
-            catch (TimeoutException)
-            {
-                Assert.Fail("The follow-up request waited out RequestTimeout instead of being handled.");
+                await followUp;
             }
             catch (Exception error)
             {
+                failure = error;
+            }
+
+            if (failure is not null)
+            {
+                Assert.IsNotInstanceOfType<TimeoutException>(
+                    failure,
+                    "The follow-up request waited out RequestTimeout instead of being handled.");
                 Assert.IsInstanceOfType<Xrpl.Client.Exceptions.NotConnectedException>(
-                    error,
-                    $"A refused follow-up must say the client is not connected, not fail with {error.GetType().Name}: {error.Message}");
+                    failure,
+                    $"A refused follow-up must say the client is not connected, not fail with {failure.GetType().Name}: {failure.Message}");
             }
         }
 
@@ -291,23 +297,26 @@ namespace Xrpl.Tests
                 $"{AcceptableBound.TotalSeconds:F0}s - it went into the socket being closed and waits out " +
                 $"RequestTimeout ({RequestTimeout.TotalSeconds:F0}s).");
 
+            // Captured first, judged afterwards - see the test above.
+            Exception failure = null;
             try
             {
                 await followUp;
-                Assert.Fail("A request issued during Disconnect() must not succeed - there is no connection to serve it.");
-            }
-            catch (TimeoutException)
-            {
-                Assert.Fail("The follow-up request waited out RequestTimeout instead of being refused.");
             }
             catch (Exception error)
             {
-                Assert.IsTrue(
-                    error is Xrpl.Client.Exceptions.NotConnectedException
-                        or Xrpl.Client.Exceptions.DisconnectedException
-                        or OperationCanceledException,
-                    $"A request issued during Disconnect() must be refused as not connected, not {error.GetType().Name}: {error.Message}");
+                failure = error;
             }
+
+            Assert.IsNotNull(failure, "A request issued during Disconnect() must not succeed - there is no connection to serve it.");
+            Assert.IsNotInstanceOfType<TimeoutException>(
+                failure,
+                "The follow-up request waited out RequestTimeout instead of being refused.");
+            Assert.IsTrue(
+                failure is Xrpl.Client.Exceptions.NotConnectedException
+                    or Xrpl.Client.Exceptions.DisconnectedException
+                    or OperationCanceledException,
+                $"A request issued during Disconnect() must be refused as not connected, not {failure.GetType().Name}: {failure.Message}");
         }
     }
 }

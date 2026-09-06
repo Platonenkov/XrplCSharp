@@ -2815,10 +2815,16 @@ public class Connection
     private volatile int _pingRunning = 0;
 
     /// <summary>
-    /// True inside a ping check and everything it awaits. The fast-reconnect path is awaited from
-    /// there, and it must be able to tell that the ping it would wait for is the one it is running in.
+    /// True inside this connection's ping check and everything it awaits. The fast-reconnect path
+    /// is awaited from there, and it must be able to tell that the ping it would wait for is the
+    /// one it is running in.
     /// </summary>
-    private static readonly AsyncLocal<bool> _insidePingCheck = new AsyncLocal<bool>();
+    /// <remarks>
+    /// Per instance, not static: the value follows the execution context, so a consumer's
+    /// <c>OnPing</c> handler that awaits another connection would carry a static flag into that
+    /// connection and let it skip waiting for its own ping.
+    /// </remarks>
+    private readonly AsyncLocal<bool> _insidePingCheck = new AsyncLocal<bool>();
 
     private Task? _pingLoopTask = null;
 
