@@ -2303,11 +2303,19 @@ public class Connection
             return;
         }
 
+        SetConnectionState(
+            XrpConnectionState.RestoringConnection,
+            message: $"OnConnected handler failed: {error.Message}. Reconnecting...",
+            ConnectionCloseSeverity.Warning,
+            reconnect: BuildReconnectInfo(failures));
+
         // Always tear down the socket the handler actually ran for. WebSocketClient.Connect invokes its
         // OnConnect callback without awaiting it, so the connect lock can be released while this method is
         // still running: by now `ws` may already point at a newer socket that must not be touched.
         // Cleared before the sweep below, for the reason given in ChangeServer (issue #177): the
         // socket is open, and a request issued from a rejected continuation would otherwise go into it.
+        // Taken after the notification above on purpose: the check that comes with the clear is the
+        // one that sees what the consumer's handler did.
         bool wasCurrentSocket;
         lock (_disconnectLock)
         {
@@ -2320,20 +2328,15 @@ public class Connection
 
         if (!wasCurrentSocket)
         {
-            // Replaced between the ownership check above and here - the OnError notification and the
-            // give-up branch in between hand control to consumer code. A newer connection owns the
-            // ping timer, the pending requests, the message processor and the reconnect state now;
-            // this callback closes the socket its handler ran for and steps aside.
+            // Replaced since the ownership check at the top - the OnError notification, the give-up
+            // branch and the RestoringConnection notification in between all hand control to consumer
+            // code, and a ChangeServer from any of them retires this socket itself. A newer connection
+            // owns the ping timer, the pending requests, the message processor and the reconnect state
+            // now; this callback closes the socket its handler ran for and steps aside.
             failedSocket.Cancel();
             failedSocket.Disconnect();
             return;
         }
-
-        SetConnectionState(
-            XrpConnectionState.RestoringConnection,
-            message: $"OnConnected handler failed: {error.Message}. Reconnecting...",
-            ConnectionCloseSeverity.Warning,
-            reconnect: BuildReconnectInfo(failures));
 
         StopPingTimerSync();
         requestManager.RejectAllWithCancellation();
