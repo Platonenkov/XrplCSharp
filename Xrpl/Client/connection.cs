@@ -334,7 +334,9 @@ public class Connection
 
     public string url { get; private set; }
 
-    public WebSocketClient ws;
+    // Volatile: this is the connectivity gate. It is cleared under _disconnectLock by the
+    // retirement paths and read lock-free by ShouldBeConnected/State/CheckIfNotConnected.
+    public volatile WebSocketClient ws;
 
     private int? reconnectTimeoutID = null;
 
@@ -492,8 +494,8 @@ public class Connection
     /// timer stopped taking the processor down with it.
     /// <para>
     /// <c>Volatile.Read</c> rather than a plain read or <c>_messageProcessorLock</c>: the field is
-    /// written under that lock, and holding it here would mean waiting out
-    /// <c>StopMessageProcessorInternal</c>, which blocks up to two seconds on the reader task.
+    /// written under that lock, and a read that never contends with a stop in progress is all
+    /// this needs.
     /// </para>
     /// </remarks>
     internal bool IsMessageProcessorRunning => Volatile.Read(ref _streamMessageChannel) != null;
@@ -518,7 +520,7 @@ public class Connection
 
     /// <summary>
     /// Completes the stream channel's writer without clearing the channel, reproducing the state
-    /// <c>StopMessageProcessorInternal</c> leaves behind for anyone who read
+    /// <c>DetachMessageProcessor</c> leaves behind for anyone who read
     /// <c>_streamMessageChannel</c> just before it was cleared.
     /// </summary>
     /// <remarks>
@@ -766,17 +768,14 @@ public class Connection
         // processor is explicit since StopPingTimerSync no longer does it as a side effect - this
         // session's queue goes with the session.
         StopPingTimerSync();
-        StopMessageProcessor();
-        
-        // 3. Reject all pending requests BEFORE waiting for ping
-        // This allows the ping handler to receive OperationCanceledException and exit quickly
-        requestManager.RejectAllWithCancellation();
-        connectionManager.RejectAllAwaitingWithCancellation();
-        
-        // 4. Now wait for ping to finish (should be very fast since requests were rejected)
-        await WaitForPingToFinishAsync();
 
-        // 5. Mark old session as retiring (callbacks will be ignored)
+        // 3. Mark old session as retiring (callbacks will be ignored) and clear ws - BEFORE
+        // rejecting the pending requests, on purpose.
+        // The rejection sweep resumes consumer continuations - inline on this thread when there
+        // is no synchronization context - and a consumer that issues its next request from there
+        // must already see no usable connection. Cleared afterwards, that request passes the
+        // connectivity check on the old socket and is written into it after the sweep that would
+        // have rejected it; nothing completes it before RequestTimeout (issue #177).
         ConnectionSession? oldSession;
         lock (_sessionLock)
         {
@@ -784,13 +783,25 @@ public class Connection
             oldSession?.MarkAsRetiring();
         }
 
-        // 6. Capture old socket and clear ws reference
         WebSocketClient? oldSocket;
         lock (_disconnectLock)
         {
             oldSocket = ws;
             ws = null;
         }
+
+        // 4. Reject all pending requests BEFORE waiting for ping
+        // This allows the ping handler to receive OperationCanceledException and exit quickly
+        requestManager.RejectAllWithCancellation();
+        connectionManager.RejectAllAwaitingWithCancellation();
+
+        // 5. The message processor goes with the session, and its reader is let go of after the
+        // sweep, not before: consumers are released first, and this is the first yield of the
+        // switch - what a single-threaded host runs their continuations on.
+        await StopMessageProcessorAsync();
+
+        // 6. Now wait for ping to finish (should be very fast since requests were rejected)
+        await WaitForPingToFinishAsync();
 
         // 7. Mark old socket for intentional disconnect (per-socket tracking only)
         // CRITICAL: Do NOT set global _isIntentionalDisconnect = true here - same rule as the ping/network
@@ -915,17 +926,14 @@ public class Connection
         // 4. Stop ping timer and the message processor (but don't wait yet) - the queue belongs
         // to the session being retired.
         StopPingTimerSync();
-        StopMessageProcessor();
-        
-        // 5. Reject all pending requests BEFORE waiting for ping
-        // This allows the ping handler to receive OperationCanceledException and exit quickly
-        requestManager.RejectAllWithCancellation();
-        connectionManager.RejectAllAwaitingWithCancellation();
-        
-        // 6. Now wait for ping to finish (should be very fast since requests were rejected)
-        await WaitForPingToFinishAsync().ConfigureAwait(false);
 
-        // 7. Mark old session as retiring (callbacks will be ignored)
+        // 5. Mark old session as retiring (callbacks will be ignored) and clear ws - BEFORE
+        // rejecting the pending requests, on purpose.
+        // The rejection sweep resumes consumer continuations - inline on this thread when there
+        // is no synchronization context - and a consumer that issues its next request from there
+        // must already see no usable connection. Cleared afterwards, that request passes the
+        // connectivity check on the old socket and is written into it after the sweep that would
+        // have rejected it; nothing completes it before RequestTimeout (issue #177).
         ConnectionSession? oldSession;
         lock (_sessionLock)
         {
@@ -933,13 +941,24 @@ public class Connection
             oldSession?.MarkAsRetiring();
         }
 
-        // 8. Capture old socket and clear ws reference
         WebSocketClient? oldSocket;
         lock (_disconnectLock)
         {
             oldSocket = ws;
             ws = null;
         }
+
+        // 6. Reject all pending requests BEFORE waiting for ping
+        // This allows the ping handler to receive OperationCanceledException and exit quickly
+        requestManager.RejectAllWithCancellation();
+        connectionManager.RejectAllAwaitingWithCancellation();
+
+        // 7. The message processor goes with the session (see ChangeServer for the ordering).
+        await StopMessageProcessorAsync().ConfigureAwait(false);
+
+        // 8. Now wait for the ping to finish. This method runs inside the ping check itself, so
+        // the wait returns at once - see WaitForPingToFinishAsync.
+        await WaitForPingToFinishAsync().ConfigureAwait(false);
 
         // 9. Mark old socket for intentional disconnect (per-socket tracking only)
         // CRITICAL: Do NOT set global _isIntentionalDisconnect = true for ping/network recoveries!
@@ -1060,6 +1079,19 @@ public class Connection
             if (_permanentlyDisconnected)
             {
                 Debug.WriteLine($"{DateTime.Now}Fast reconnect abandoned - the client was disconnected by the user: {ex.Message}");
+                return;
+            }
+
+            // The wait above ends in cancellation when its own source is retired, and on success the
+            // path that retires it is OnceOpen: the attempt above failed at the socket, the failure
+            // callback started the reconnect loop on this same source, and that loop connected
+            // first. A client that is connected has nothing to reconnect. Treating this as a failure
+            // started a second loop, whose first attempt retired the live socket and opened another -
+            // one reconnect became two, with a RestoringConnection reported on a healthy client.
+            if (IsConnected())
+            {
+                _isFastReconnectActive = false;
+                Debug.WriteLine($"{DateTime.Now}Fast reconnect settled by the reconnect loop: {ex.Message}");
                 return;
             }
 
@@ -1375,42 +1407,41 @@ public class Connection
         _isIntentionalDisconnect = true;
         _permanentlyDisconnected = true;
 
-        var currentSocket = ws;
-        if (currentSocket != null)
-        {
-            MarkSocketAsUserInitiated(currentSocket);
-            currentSocket.SetIntentionalDisconnect();
-        }
-
-        ClearReconnectState(); // Clear all reconnect state on user disconnect
-        StopPingTimerSync();
-        StopMessageProcessor();
-        
-        // Reject pending requests so ping handler can exit quickly
-        requestManager.RejectAllWithCancellation();
-        connectionManager.RejectAllAwaitingWithCancellation();
-        
-        await WaitForPingToFinishAsync();
-
+        // Capture the socket and clear ws BEFORE rejecting the pending requests - see ChangeServer
+        // for why: the sweep runs consumer continuations, and a request issued from one of them
+        // must not find the socket being closed still installed as the connection (issue #177).
         WebSocketClient? socketToClose;
         lock (_disconnectLock)
         {
             socketToClose = ws;
             ws = null;
 
-            if (socketToClose == null)
+            if (socketToClose != null)
             {
-                SetConnectionState(XrpConnectionState.Disconnected, message: "Already disconnected.");
-                return 0;
-            }
+                MarkSocketAsUserInitiated(socketToClose);
+                socketToClose.SetIntentionalDisconnect();
 
-            MarkSocketAsUserInitiated(socketToClose);
-            socketToClose.SetIntentionalDisconnect();
-
-            if (_disconnectTcs == null || _disconnectTcs.Task.IsCompleted)
-            {
-                _disconnectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (_disconnectTcs == null || _disconnectTcs.Task.IsCompleted)
+                {
+                    _disconnectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                }
             }
+        }
+
+        ClearReconnectState(); // Clear all reconnect state on user disconnect
+        StopPingTimerSync();
+
+        // Reject pending requests so ping handler can exit quickly
+        requestManager.RejectAllWithCancellation();
+        connectionManager.RejectAllAwaitingWithCancellation();
+
+        await StopMessageProcessorAsync();
+        await WaitForPingToFinishAsync();
+
+        if (socketToClose == null)
+        {
+            SetConnectionState(XrpConnectionState.Disconnected, message: "Already disconnected.");
+            return 0;
         }
 
         Interlocked.Exchange(ref _userInitiatedSocket, socketToClose);
@@ -1431,46 +1462,57 @@ public class Connection
         _isIntentionalDisconnect = true;
         _permanentlyDisconnected = true;
 
-        var currentSocket = ws;
-        if (currentSocket != null)
-        {
-            MarkSocketAsUserInitiated(currentSocket);
-            currentSocket.SetIntentionalDisconnect();
-        }
-
-        ClearReconnectState(); // Clear all reconnect state on user disconnect
-        StopPingTimerSync();
-        StopMessageProcessor();
-        
-        // Reject pending requests so ping handler can exit quickly
-        requestManager.RejectAllWithCancellation();
-        connectionManager.RejectAllAwaitingWithCancellation();
-        
-        await WaitForPingToFinishAsync();
-
-        TaskCompletionSource<bool> tcs;
+        // Same ordering as Disconnect(): the socket leaves ws before the sweep runs (issue #177).
+        TaskCompletionSource<bool>? tcs = null;
         WebSocketClient? socketToClose;
-
         lock (_disconnectLock)
         {
             socketToClose = ws;
             ws = null;
 
-            if (socketToClose == null)
+            if (socketToClose != null)
             {
-                SetConnectionState(XrpConnectionState.Disconnected, message: "Already disconnected.");
-                return;
+                MarkSocketAsUserInitiated(socketToClose);
+                socketToClose.SetIntentionalDisconnect();
+
+                if (_disconnectTcs == null || _disconnectTcs.Task.IsCompleted)
+                {
+                    _disconnectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                }
+
+                tcs = _disconnectTcs;
+            }
+        }
+
+        ClearReconnectState(); // Clear all reconnect state on user disconnect
+        StopPingTimerSync();
+
+        // Reject pending requests so ping handler can exit quickly
+        requestManager.RejectAllWithCancellation();
+        connectionManager.RejectAllAwaitingWithCancellation();
+
+        await StopMessageProcessorAsync();
+        await WaitForPingToFinishAsync();
+
+        if (socketToClose == null || tcs == null)
+        {
+            // Nothing here to close - but another DisconnectAndWaitAsync may be mid-way, having
+            // taken the socket already. This call promised to return once the socket is gone, so
+            // it waits on that one's completion source rather than reporting a disconnect that
+            // has not finished.
+            TaskCompletionSource<bool>? inProgress;
+            lock (_disconnectLock)
+            {
+                inProgress = _disconnectTcs;
             }
 
-            MarkSocketAsUserInitiated(socketToClose);
-            socketToClose.SetIntentionalDisconnect();
-
-            if (_disconnectTcs == null || _disconnectTcs.Task.IsCompleted)
+            if (inProgress is { Task.IsCompleted: false })
             {
-                _disconnectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                await Task.WhenAny(inProgress.Task, Task.Delay(timeout, cancellationToken));
             }
 
-            tcs = _disconnectTcs;
+            SetConnectionState(XrpConnectionState.Disconnected, message: "Already disconnected.");
+            return;
         }
 
         Interlocked.Exchange(ref _userInitiatedSocket, socketToClose);
@@ -2021,8 +2063,11 @@ public class Connection
         {
             WebsocketSendAsync(ws, _request.Message);
         }
-        catch (EncodingFormatException error)
+        catch (Exception error) when (error is EncodingFormatException or DisconnectedException)
         {
+            // The connection can be retired between the check above and this send. The request
+            // never left, so it must not stay pending until RequestTimeout: the rejection is what
+            // the await below surfaces to the caller.
             requestManager.Reject(_request.Id, error);
         }
 
@@ -2043,8 +2088,11 @@ public class Connection
         {
             WebsocketSendAsync(ws, _request.Message);
         }
-        catch (EncodingFormatException error)
+        catch (Exception error) when (error is EncodingFormatException or DisconnectedException)
         {
+            // The connection can be retired between the check above and this send. The request
+            // never left, so it must not stay pending until RequestTimeout: the rejection is what
+            // the await below surfaces to the caller.
             requestManager.Reject(_request.Id, error);
         }
 
@@ -2076,6 +2124,17 @@ public class Connection
         }
 
         if (!isActiveSession) // Callback from a retired session - ignore silently
+        {
+            return;
+        }
+
+        // A user Disconnect() that landed while this socket was still connecting has marked it and
+        // is closing it. Installing it here would undo the disconnect: ws restored, the
+        // intentional-disconnect tracking cleared below, and the close that follows read as a
+        // network drop that starts a reconnect loop. The session check above does not cover this -
+        // Disconnect() does not retire the session, because OnceClose is what announces a user
+        // disconnect - so the socket's own marks are the signal.
+        if (_permanentlyDisconnected || IsSocketUserInitiated(connectedSocket))
         {
             return;
         }
@@ -2171,10 +2230,6 @@ public class Connection
     /// <param name="error">The exception thrown by the handler.</param>
     private async Task OnConnectHandlerFailedAsync(WebSocketClient failedSocket, Exception error)
     {
-        int failures = Interlocked.Increment(ref _connectHandlerFailures);
-
-        Debug.WriteLine($"{DateTime.Now}OnConnected handler failed ({failures}): {error.Message}");
-
         var errorHandler = OnError;
         if (errorHandler is not null)
         {
@@ -2190,6 +2245,23 @@ public class Connection
             }
         }
 
+        // Ownership first, before anything below counts or tears down. WebSocketClient.Connect invokes
+        // its OnConnect callback without awaiting it, so this can run after a newer socket has replaced
+        // the one whose handler failed. That socket's failure is not a failure of the current
+        // connection: it must not count towards giving up, and the give-up branch - RejectAll and
+        // Disconnect() - would take the live connection down for a callback that belongs to a dead one.
+        // Read-only here; the clear under the same lock happens below, once this path owns the teardown.
+        if (!IsCurrentSocket(failedSocket))
+        {
+            failedSocket.Cancel();
+            failedSocket.Disconnect();
+            return;
+        }
+
+        int failures = Interlocked.Increment(ref _connectHandlerFailures);
+
+        Debug.WriteLine($"{DateTime.Now}OnConnected handler failed ({failures}): {error.Message}");
+
         bool giveUp = config.StopAfterMaxAttempts && failures >= config.MaxReconnectAttempts;
         if (giveUp)
         {
@@ -2204,6 +2276,16 @@ public class Connection
                 message:
                 $"OnConnected handler failed {failures} time(s) in a row: {error.Message}. Giving up after {config.MaxReconnectAttempts} attempts. Call Connect() to retry.",
                 ConnectionCloseSeverity.Error);
+
+            // The notification above ran consumer code. A handler that answered "gave up" with a
+            // ChangeServer has already taken this socket out of ws and is opening another; the
+            // teardown below would then reject that connection's requests and close its socket.
+            if (!IsCurrentSocket(failedSocket))
+            {
+                failedSocket.Cancel();
+                failedSocket.Disconnect();
+                return;
+            }
 
             // Rejected here, before Disconnect(), and with the reason that is actually true. The
             // requests in flight are being stopped because this client gave up connecting, not
@@ -2227,14 +2309,13 @@ public class Connection
             ConnectionCloseSeverity.Warning,
             reconnect: BuildReconnectInfo(failures));
 
-        StopPingTimerSync();
-        StopMessageProcessor();
-        requestManager.RejectAllWithCancellation();
-        await WaitForPingToFinishAsync();
-
         // Always tear down the socket the handler actually ran for. WebSocketClient.Connect invokes its
         // OnConnect callback without awaiting it, so the connect lock can be released while this method is
         // still running: by now `ws` may already point at a newer socket that must not be touched.
+        // Cleared before the sweep below, for the reason given in ChangeServer (issue #177): the
+        // socket is open, and a request issued from a rejected continuation would otherwise go into it.
+        // Taken after the notification above on purpose: the check that comes with the clear is the
+        // one that sees what the consumer's handler did.
         bool wasCurrentSocket;
         lock (_disconnectLock)
         {
@@ -2245,16 +2326,27 @@ public class Connection
             }
         }
 
+        if (!wasCurrentSocket)
+        {
+            // Replaced since the ownership check at the top - the OnError notification, the give-up
+            // branch and the RestoringConnection notification in between all hand control to consumer
+            // code, and a ChangeServer from any of them retires this socket itself. A newer connection
+            // owns the ping timer, the pending requests, the message processor and the reconnect state
+            // now; this callback closes the socket its handler ran for and steps aside.
+            failedSocket.Cancel();
+            failedSocket.Disconnect();
+            return;
+        }
+
+        StopPingTimerSync();
+        requestManager.RejectAllWithCancellation();
+        await StopMessageProcessorAsync();
+        await WaitForPingToFinishAsync();
+
         // The socket is deliberately NOT marked as user-initiated: OnceClose must treat this as a real
         // close so the standard reconnect path runs instead of the "closed permanently" branch.
         failedSocket.Cancel();
         failedSocket.Disconnect();
-
-        if (!wasCurrentSocket)
-        {
-            // A newer connection already replaced this socket - it owns the reconnect state now.
-            return;
-        }
 
         // Take ownership of the reconnect state instead of asking "is a loop already running?".
         // This method can run inside the reconnect loop's own attempt: that loop breaks as soon as the
@@ -2269,6 +2361,18 @@ public class Connection
         // that means connect -> handler failure -> teardown forever at a constant 2s, a sustained
         // connection load on a node that accepts TCP but cannot serve requests yet.
         RestartReconnectLoop(initialAttempts: failures);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="socket"/> is the one installed as the connection right now. Read
+    /// under <c>_disconnectLock</c>, the lock every retirement path clears <c>ws</c> under.
+    /// </summary>
+    private bool IsCurrentSocket(WebSocketClient socket)
+    {
+        lock (_disconnectLock)
+        {
+            return ReferenceEquals(ws, socket);
+        }
     }
 
     /// <summary>
@@ -2369,7 +2473,7 @@ public class Connection
         // Only for the current socket - and the message processor goes with it, this connection
         // is over.
         StopPingTimerSync();
-        StopMessageProcessor();
+        await StopMessageProcessorAsync();
 
         // Check if this is a network drop (FailureReason set by WebSocketClient)
         var isNetworkDrop = closingSocket.FailureReason == SocketFailureReason.NetworkDrop;
@@ -2657,6 +2761,24 @@ public class Connection
                 // =====================================================
                 // SESSION ISOLATION (same as ChangeServer)
                 // =====================================================
+                // Somebody else connected while this loop was waiting out its delay - another
+                // attempt on the same source, or the fast-reconnect path. Whatever is in ws is live,
+                // and retiring it below would trade a healthy connection for a reconnect nobody
+                // needed. Every path that starts this loop does so because the connection is gone,
+                // so an open socket here always belongs to someone who got there first.
+                if (IsConnected())
+                {
+                    lock (_reconnectStateLock)
+                    {
+                        if (ReferenceEquals(_reconnectCts, ownCts))
+                        {
+                            _reconnectAttempts = 0;
+                        }
+                    }
+
+                    break;
+                }
+
                 // Mark old session as retiring before creating new connection
                 // so late callbacks from old socket are properly ignored.
                 ConnectionSession? oldSession;
@@ -2760,6 +2882,18 @@ public class Connection
 
     private volatile int _pingRunning = 0;
 
+    /// <summary>
+    /// True inside this connection's ping check and everything it awaits. The fast-reconnect path
+    /// is awaited from there, and it must be able to tell that the ping it would wait for is the
+    /// one it is running in.
+    /// </summary>
+    /// <remarks>
+    /// Per instance, not static: the value follows the execution context, so a consumer's
+    /// <c>OnPing</c> handler that awaits another connection would carry a static flag into that
+    /// connection and let it skip waiting for its own ping.
+    /// </remarks>
+    private readonly AsyncLocal<bool> _insidePingCheck = new AsyncLocal<bool>();
+
     private Task? _pingLoopTask = null;
 
     private System.Threading.Timer? _wasmPingTimer;
@@ -2807,6 +2941,8 @@ public class Connection
 
     private async Task ExecutePingCheckAsync(CancellationTokenSource cts)
     {
+        _insidePingCheck.Value = true;
+
         try
         {
             if (cts.IsCancellationRequested)
@@ -3066,7 +3202,17 @@ public class Connection
     {
         // Clear the task reference
         Interlocked.Exchange(ref _currentPingTask, value: null);
-        
+
+        // Called from inside the ping check - RetireCurrentSessionAndReconnectAsync is awaited from
+        // there, and only from there. The flag polled below is this very check's, and it cannot
+        // clear before the check returns, which is after this method: the wait could only ever run
+        // out its timeout, and did, on every ping-triggered reconnect. The ping is not running
+        // alongside the retirement here; it is the retirement.
+        if (_insidePingCheck.Value)
+        {
+            return;
+        }
+
         // Wait for _pingRunning to become 0 (ping task's finally block will reset it)
         // Since we already rejected pending requests, the ping should exit very quickly
         var startTime = DateTime.UtcNow;
@@ -3241,8 +3387,11 @@ public class Connection
     {
         lock (_messageProcessorLock)
         {
-            // Stop any existing processor first
-            StopMessageProcessorInternal();
+            // Detach any leftover without waiting for it: its channel is completed and its source
+            // cancelled, so it exits on its own, and its frames belong to a session that is already
+            // retired. Waiting here used to block OnceOpen on a single-threaded host.
+            (Task? leftoverTask, CancellationTokenSource? leftoverCts) = DetachMessageProcessor();
+            _ = AwaitMessageProcessorExitAsync(leftoverTask, leftoverCts);
             
             // Create new session-bound channel and CTS
             // Using bounded channel to prevent memory issues under high load
@@ -3301,47 +3450,66 @@ public class Connection
     /// <summary>
     /// Stops the background message processor and disposes resources.
     /// </summary>
-    private void StopMessageProcessor()
+    private Task StopMessageProcessorAsync()
     {
+        (Task? task, CancellationTokenSource? cts) detached;
         lock (_messageProcessorLock)
         {
-            StopMessageProcessorInternal();
+            detached = DetachMessageProcessor();
         }
+
+        return AwaitMessageProcessorExitAsync(detached.task, detached.cts);
     }
 
     /// <summary>
-    /// Internal stop logic - must be called with _messageProcessorLock held.
-    /// Completes the channel, cancels the CTS, and awaits task completion.
+    /// Takes the processor's channel, source and task out of their fields, completes the channel
+    /// and cancels the source, so the reader exits on its own. Must be called with
+    /// <c>_messageProcessorLock</c> held. Does not wait for the reader: that is
+    /// <see cref="AwaitMessageProcessorExitAsync"/>, outside the lock.
     /// </summary>
-    private void StopMessageProcessorInternal()
+    private (Task? task, CancellationTokenSource? cts) DetachMessageProcessor()
     {
         var channel = _streamMessageChannel;
         var cts = _messageProcessorCts;
         var task = _messageProcessorTask;
-        
+
         _streamMessageChannel = null;
         _messageProcessorCts = null;
         _messageProcessorTask = null;
-        
+
         // Complete the channel first to unblock WaitToReadAsync
         if (channel != null)
         {
             try { channel.Writer.Complete(); } catch { }
         }
-        
+
         // Then cancel the CTS
         if (cts != null)
         {
             try { cts.Cancel(); } catch { }
         }
-        
-        // Wait for task to complete (with timeout to prevent deadlock)
+
+        return (task, cts);
+    }
+
+    /// <summary>
+    /// Waits up to two seconds for a detached reader to exit, then disposes its source.
+    /// </summary>
+    /// <remarks>
+    /// This used to be a blocking <c>Task.Wait</c> with the same cap. On a single-threaded host
+    /// (Blazor WebAssembly) the reader's continuation needs the very thread that was blocked in
+    /// order to observe the completed channel, so the wait never returned early: every
+    /// <c>ChangeServer</c>, fast reconnect and <c>Disconnect</c> stalled the UI for the full two
+    /// seconds. Awaited, the reader runs and is gone in milliseconds. The cap is kept for a reader
+    /// stuck inside a consumer handler, and the source is disposed regardless, as before.
+    /// </remarks>
+    private static async Task AwaitMessageProcessorExitAsync(Task? task, CancellationTokenSource? cts)
+    {
         if (task != null)
         {
-            try { task.Wait(TimeSpan.FromSeconds(2)); } catch { }
+            await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(2))).ConfigureAwait(false);
         }
-        
-        // Dispose resources
+
         cts?.Dispose();
     }
 
@@ -3805,7 +3973,7 @@ public class Connection
         // The channel is bounded with DropOldest, so a full queue is not a refusal: TryWrite
         // evicts the oldest frame, counts it through itemDropped and reports success. It
         // refuses only a completed writer - and that happens on the ordinary path, not just in
-        // some corner: StopMessageProcessorInternal completes the writer after clearing
+        // some corner: DetachMessageProcessor completes the writer after clearing
         // _streamMessageChannel, so a reader that got the reference an instant earlier writes
         // into a channel that is already closed. StartPingTimer tears the processor down and
         // StartMessageProcessor builds it again on every connect, so the window recurs.
