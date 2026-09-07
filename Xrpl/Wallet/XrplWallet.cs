@@ -1220,6 +1220,21 @@ namespace Xrpl.Wallet
         }
 
         /// <summary>
+        /// Signs a transaction offline in a stated role: the typed counterpart of
+        /// <see cref="Sign(Dictionary{string, object}, bool, string?, SignatureRole)"/>, for the one
+        /// shape where the transaction does not say which of its signatures this is.
+        /// </summary>
+        /// <param name="tx">A transaction to be signed offline.</param>
+        /// <param name="multisign">True to produce a multi-signature entry rather than a single signature.</param>
+        /// <param name="signingFor">The signing account (classic or X-address); this wallet's own by default.</param>
+        /// <param name="role">Which signature of the transaction this key is producing.</param>
+        public SignatureResult Sign(ITransactionRequest tx, bool multisign, string? signingFor, SignatureRole role)
+        {
+            Dictionary<string, object> txJson = JsonSerializer.Deserialize<Dictionary<string, object>>(tx.ToJson(), XrplJsonOptions.Default);
+            return Sign(txJson, multisign, signingFor, role);
+        }
+
+        /// <summary>
         /// Verifies a signed transaction offline.
         /// </summary>
         /// <param name="signedTransaction">A signed transaction (hex string of signTransaction result) to be verified offline.</param>
@@ -1320,8 +1335,9 @@ namespace Xrpl.Wallet
         /// <summary>
         /// Signs a sponsored transaction as the sponsor (XLS-68).
         /// Computes the signing preimage and adds SponsorSignature (inner STObject
-        /// with this wallet's SigningPubKey and TxnSignature over the sponsor preimage
-        /// the submitter signs). The transaction must carry Sponsor = this wallet's address.
+        /// with this wallet's SigningPubKey and TxnSignature over the sponsor preimage, which
+        /// since fixCleanup3_4_0 is not the one the submitter signs). The transaction must carry
+        /// Sponsor = this wallet's address.
         ///
         /// <b>V3 (sequential) — sponsor signs first, passes to submitter:</b>
         /// <code>

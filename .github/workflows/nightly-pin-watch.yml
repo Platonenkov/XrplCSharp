@@ -195,9 +195,17 @@ jobs:
           out=$(dotnet run --project Tools/GenerateEnums -- diff http://localhost:5005 2>&1)
           status=$?
           echo "$out"
+          # 0 is in sync and 1 is drift; anything else is the tool failing to answer at all,
+          # and an empty grep would then reach the PR body as "no differences reported".
+          if [ "$status" -eq 0 ] || [ "$status" -eq 1 ]; then
+            summary=$(printf '%s\n' "$out" | grep -E 'node-only|mismatch|^Summary')
+            [ -n "$summary" ] || summary='no differences reported'
+          else
+            summary=$(printf 'the definitions diff did not run (exit %s), so this section says nothing about drift:\n%s' "$status" "$out")
+          fi
           {
             echo 'summary<<EOF'
-            printf '%s\n' "$out" | grep -E 'node-only|mismatch|^Summary' || echo 'no differences reported'
+            printf '%s\n' "$summary"
             echo 'EOF'
             echo "status=$status"
           } >> "$GITHUB_OUTPUT"
