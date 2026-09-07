@@ -18,6 +18,9 @@ using Xrpl.Models.Transactions;
 using Xrpl.Models.Utils;
 using Xrpl.Utils.Hashes;
 
+// Xrpl.Utils.Hashes declares a HashPrefix of its own; the codec's is the one that prefixes a signing preimage.
+using HashPrefix = Xrpl.BinaryCodec.Hashing.HashPrefix;
+
 // https://github.com/XRPLF/xrpl.js/blob/main/packages/xrpl/src/Wallet/index.ts
 
 namespace Xrpl.Wallet
@@ -633,6 +636,41 @@ namespace Xrpl.Wallet
         }
 
         /// <summary>
+        /// Signs a transaction offline in a stated role, for the one shape where the transaction
+        /// does not say which signature this is: a multi-signature entry on a transaction whose
+        /// main signature is multi-signed too, or which names both a Sponsor and a Counterparty.
+        /// </summary>
+        /// <remarks>
+        /// Everywhere else the role follows from the transaction and this overload is not needed;
+        /// see <see cref="SignatureRole"/>. An overload rather than a fourth optional parameter,
+        /// which would be source-compatible but not binary-compatible.
+        /// </remarks>
+        /// <param name="transaction">A transaction to be signed offline.</param>
+        /// <param name="multisign">True to produce a multi-signature entry rather than a single signature.</param>
+        /// <param name="signingFor">The signing account (classic or X-address); this wallet's own by default.</param>
+        /// <param name="role">Which signature of the transaction this key is producing.</param>
+        public SignatureResult Sign(
+            Dictionary<string, object> transaction,
+            bool multisign,
+            string? signingFor,
+            SignatureRole role)
+        {
+            GuardMemos(transaction);
+
+            if (!multisign)
+            {
+                return role switch
+                {
+                    SignatureRole.Sponsor => SignAsSponsor(transaction),
+                    SignatureRole.Counterparty => SignAsLoanCounterparty(transaction),
+                    _ => Sign(transaction, false, signingFor),
+                };
+            }
+
+            return SignMulti(transaction, NormalizeClassic(signingFor), role);
+        }
+
+        /// <summary>
         /// Signs a transaction offline.
         /// </summary>
         /// <param name="transaction">A transaction to be signed offline.</param>
@@ -675,9 +713,9 @@ namespace Xrpl.Wallet
             }
             // 2) XLS-68: when this wallet is the transaction's Sponsor, route to the
             // sponsor co-signature path automatically (same pattern as the Batch
-            // inner-signer routing above). Multisig signing is exempt: a Signer
-            // entry is section-agnostic (identical preimage for tx.Signers and
-            // SponsorSignature.Signers), so the role is decided at composition time.
+            // inner-signer routing above). Multisig signing is exempt here because
+            // the sponsor's own key is not what signs then: the entries come from the
+            // sponsor's SignerList, and SignMulti works their role out for itself.
             if (!multisign
                 && transaction.TryGetValue("Sponsor", out var sponsorField)
                 && sponsorField is string sponsorAddress
@@ -748,6 +786,61 @@ namespace Xrpl.Wallet
 
 
         private SignatureResult SignMulti(Dictionary<string, object> transaction, string signerAccount)
+            => SignMulti(transaction, signerAccount, null);
+
+        /// <summary>
+        /// The prefix a multi-signature entry is signed under.
+        /// </summary>
+        /// <remarks>
+        /// Until fixCleanup3_4_0 an entry was section-agnostic: <c>tx.Signers</c>,
+        /// <c>SponsorSignature.Signers</c> and <c>CounterpartySignature.Signers</c> all covered
+        /// the same bytes, and which section an entry belonged to was settled when the parts were
+        /// composed. Since the amendment the section is part of what is signed, so it has to be
+        /// known here.
+        /// <para>
+        /// It is worked out from the transaction wherever the transaction says it. A main
+        /// signature that is itself multi-signed leaves <c>SigningPubKey</c> empty, so a
+        /// non-empty one on a transaction naming a Sponsor or a Counterparty means the entry can
+        /// only belong to that co-signing side. When both a Sponsor and a Counterparty are named
+        /// on such a transaction, or when the main signature is multi-signed as well, the
+        /// transaction does not say, and the caller has to pass
+        /// <paramref name="role"/> through the <see cref="Sign(Dictionary{string, object}, bool, string?, SignatureRole)"/>
+        /// overload.
+        /// </para>
+        /// </remarks>
+        private static HashPrefix MultiSigningPrefix(JsonObject txBase, bool coSigningSide, SignatureRole? role)
+        {
+            bool hasSponsor = txBase["Sponsor"] is not null;
+            bool hasCounterparty = txBase["Counterparty"] is not null;
+
+            if (role is SignatureRole.Sponsor)
+            {
+                if (!hasSponsor)
+                    throw new ValidationException("Cannot sign as the sponsor: the transaction names no Sponsor.");
+                return HashPrefix.SponsorTransactionMultiSig;
+            }
+
+            if (role is SignatureRole.Counterparty)
+            {
+                if (!hasCounterparty)
+                    throw new ValidationException("Cannot sign as the counterparty: the transaction names no Counterparty.");
+                return HashPrefix.CounterpartyTransactionMultiSig;
+            }
+
+            if (role is SignatureRole.Transaction || !coSigningSide)
+                return HashPrefix.TransactionMultiSig;
+
+            if (hasSponsor && hasCounterparty)
+            {
+                throw new ValidationException(
+                    "The transaction names both a Sponsor and a Counterparty, so a multi-signature entry could belong to either. " +
+                    "Pass SignatureRole.Sponsor or SignatureRole.Counterparty to Sign.");
+            }
+
+            return hasSponsor ? HashPrefix.SponsorTransactionMultiSig : HashPrefix.CounterpartyTransactionMultiSig;
+        }
+
+        private SignatureResult SignMulti(Dictionary<string, object> transaction, string signerAccount, SignatureRole? role)
         {
             // txBase is what finally goes out; it accumulates Signers.
             var txBase = JsonNode.Parse(JsonSerializer.Serialize(transaction, XrplJsonOptions.Default))?.AsObject();
@@ -769,7 +862,10 @@ namespace Xrpl.Wallet
             txForSign.Remove("TxnSignature");
             txForSign.Remove("Signers");
 
-            string preimageHex = XrplBinaryCodec.EncodeForMultiSigning(txForSign, signerAccount);
+            string preimageHex = XrplBinaryCodec.EncodeForMultiSigning(
+                txForSign,
+                signerAccount,
+                MultiSigningPrefix(txBase, sponsoredSingleMain, role));
             var preimage = Xrpl.AddressCodec.Utils.FromHex(preimageHex);
 
             string sig = Xrpl.Keypairs.XrplKeypairs.Sign(preimage, this.PrivateKey);
@@ -1197,7 +1293,7 @@ namespace Xrpl.Wallet
             if (!string.Equals(txType, "LoanSet", StringComparison.OrdinalIgnoreCase))
                 throw new ValidationException($"SignAsLoanCounterparty requires TransactionType=LoanSet, got: {txType}");
 
-            // Verify broker's SigningPubKey is present — counterparty must sign the same preimage
+            // Verify broker's SigningPubKey is present - it is part of what the counterparty signs
             string brokerSigningPubKey = tx["SigningPubKey"]?.GetValue<string>();
             if (string.IsNullOrWhiteSpace(brokerSigningPubKey))
                 throw new ValidationException("LoanSet must include broker SigningPubKey before counterparty signing.");
@@ -1206,7 +1302,7 @@ namespace Xrpl.Wallet
             tx.Remove("CounterpartySignature");
             tx.Remove("TxnSignature");
 
-            // Compute signing preimage (same preimage broker will sign)
+            // The counterparty's preimage: the same transaction as the broker's, under its own prefix
             byte[] signingBytes = LoanSigningHelper.GetSigningPreimage(tx);
 
             // Sign the preimage with this wallet's key
@@ -1224,7 +1320,7 @@ namespace Xrpl.Wallet
         /// <summary>
         /// Signs a sponsored transaction as the sponsor (XLS-68).
         /// Computes the signing preimage and adds SponsorSignature (inner STObject
-        /// with this wallet's SigningPubKey and TxnSignature over the same preimage
+        /// with this wallet's SigningPubKey and TxnSignature over the sponsor preimage
         /// the submitter signs). The transaction must carry Sponsor = this wallet's address.
         ///
         /// <b>V3 (sequential) — sponsor signs first, passes to submitter:</b>

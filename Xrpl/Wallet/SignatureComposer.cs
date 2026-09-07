@@ -16,10 +16,13 @@ namespace Xrpl.Wallet
     /// Devices sign with whatever keys they hold — single main signature,
     /// sponsor or counterparty co-signature, or portable multisig Signer
     /// entries — and the composer routes everything into the right sections.
-    /// Signer entries are section-agnostic by protocol (identical preimage for
-    /// tx.Signers, SponsorSignature.Signers and CounterpartySignature.Signers,
-    /// see rippled STTx::checkMultiSign), so only the composer needs to know
-    /// which signer belongs to which side.
+    /// Which section an entry belongs to is still decided here, by account, but it is no longer
+    /// only the composer's business: since rippled's fixCleanup3_4_0 an entry in
+    /// SponsorSignature.Signers or CounterpartySignature.Signers covers different bytes than one
+    /// in tx.Signers, so the signer had to know its side already. It works that out from the
+    /// transaction in every shape but one - see <see cref="SignatureRole"/> - and routing an entry
+    /// into a section its signer did not sign for now produces a signature the node rejects
+    /// rather than a portable one.
     /// </summary>
     public static class SignatureComposer
     {

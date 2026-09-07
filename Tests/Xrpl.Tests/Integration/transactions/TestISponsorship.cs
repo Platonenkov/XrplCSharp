@@ -33,12 +33,15 @@ public class TestISponsorship
     }
 
     [TestInitialize]
-    public void CheckSponsorAmendment()
+    public async Task CheckSponsorAmendment()
     {
         if (!sponsorAmendmentActive)
         {
             Assert.Inconclusive("Sponsor amendment (XLS-68) is not enabled on the test node; bump the nightly in .ci-config/Dockerfile.nightly and uncomment Sponsor in rippled.batchv11.cfg to run these tests.");
         }
+
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+        
     }
 
     [ClassCleanup]

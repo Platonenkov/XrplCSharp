@@ -86,8 +86,27 @@ namespace Xrpl.BinaryCodec
         /// <returns>string</returns>
         public static string EncodeForSigning(object json)
         {
+            return EncodeForSigning(json, HashPrefix.TransactionSig);
+        }
+
+        /// <summary>
+        /// Encode a transaction for signing under an explicit prefix, for a signature that is not
+        /// the transaction's own: <see cref="HashPrefix.SponsorTransactionSig"/> for
+        /// SponsorSignature, <see cref="HashPrefix.CounterpartyTransactionSig"/> for
+        /// CounterpartySignature.
+        /// </summary>
+        /// <remarks>
+        /// An overload rather than an optional parameter on the method above: a default value is
+        /// source-compatible but not binary-compatible, and an assembly built against the
+        /// one-argument signature would call a method that no longer exists.
+        /// </remarks>
+        /// <param name="json">The transaction.</param>
+        /// <param name="prefix">Prefix for the signing role.</param>
+        /// <returns>string</returns>
+        public static string EncodeForSigning(object json, HashPrefix prefix)
+        {
             JsonNode node = ObjectToJsonNode(json);
-            return SerializeJson(node, HashPrefix.TransactionSig.Bytes(), null, true);
+            return SerializeJson(node, prefix.Bytes(), null, true);
         }
 
         /// <summary>
@@ -119,9 +138,30 @@ namespace Xrpl.BinaryCodec
         /// <returns>string</returns>
         public static string EncodeForMultiSigning(object json, string signingAccount)
         {
+            return EncodeForMultiSigning(json, signingAccount, HashPrefix.TransactionMultiSig);
+        }
+
+        /// <summary>
+        /// Encode a transaction for one multi-signature under an explicit prefix, for a signer on
+        /// a co-signing account's SignerList: <see cref="HashPrefix.SponsorTransactionMultiSig"/>
+        /// for SponsorSignature.Signers, <see cref="HashPrefix.CounterpartyTransactionMultiSig"/>
+        /// for CounterpartySignature.Signers.
+        /// </summary>
+        /// <remarks>
+        /// Since fixCleanup3_4_0 a Signer entry is no longer section-agnostic: an entry made for
+        /// the transaction's own Signers covers different bytes than the same entry inside a role
+        /// section, so the signer has to know which side it signs for. An overload for the same
+        /// binary-compatibility reason as <see cref="EncodeForSigning(object, HashPrefix)"/>.
+        /// </remarks>
+        /// <param name="json">The transaction.</param>
+        /// <param name="signingAccount">The account whose key signs this entry.</param>
+        /// <param name="prefix">Prefix for the signing role.</param>
+        /// <returns>string</returns>
+        public static string EncodeForMultiSigning(object json, string signingAccount, HashPrefix prefix)
+        {
             string accountID = new AccountId(signingAccount).ToHex();
             JsonNode token = ObjectToJsonNode(json);
-            return SerializeJson(token, HashPrefix.TransactionMultiSig.Bytes(), accountID.FromHex(), true);
+            return SerializeJson(token, prefix.Bytes(), accountID.FromHex(), true);
         }
 
         private static JsonNode ObjectToJsonNode(object obj, bool ignoreNull = false)

@@ -231,6 +231,9 @@ public abstract class TestILoanBase
         LoanSet loanTx,
         XrplWallet brokerWallet)
     {
+        // A LoanSet always carries a CounterpartySignature, which is a role signature
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+
         loanTx = await client.Autofill(loanTx);
         return LoanSigningHelper.PrepareForSigning(loanTx, brokerWallet);
     }

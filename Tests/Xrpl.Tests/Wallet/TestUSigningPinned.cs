@@ -12,10 +12,17 @@ using Xrpl.Wallet;
 namespace Xrpl.Tests.Wallet.Tests
 {
     /// <summary>
-    /// Byte-level pinning of the sponsored (XLS-68) and multisig signing outputs,
-    /// captured from the pre-refactor implementation with fixed ed25519 seeds.
-    /// The unified Sign/Submit refactor (issue #43) must keep every blob
-    /// byte-identical; a diff here means the wire format changed.
+    /// Byte-level pinning of the sponsored (XLS-68) and multisig signing outputs, with fixed
+    /// ed25519 seeds. Captured from the pre-refactor implementation, so that the unified
+    /// Sign/Submit refactor (issue #43) would keep every blob byte-identical; a diff here means
+    /// the wire format changed.
+    /// <para>
+    /// SponsoredBlob was re-pinned once, when fixCleanup3_4_0 gave each signing role its own hash
+    /// prefix: the sponsor now signs different bytes, so its signature inside the blob changed.
+    /// Nothing else did - the transaction body and the submitter's own TxnSignature are the bytes
+    /// captured originally - and what makes the new value right is not this pin but rippled
+    /// accepting it, which the integration suite checks against a node carrying the amendment.
+    /// </para>
     /// </summary>
     [TestClass]
     public class TestUSigningPinned
@@ -31,9 +38,9 @@ namespace Xrpl.Tests.Wallet.Tests
             "89173623C7D093A293C154BFDA1D9A9BA12626E7BD95A07440A23DC3577B6F545B77519D34663F8896F88E682B90E2B1157F" +
             "E4CECDC2A1FE917EC50731A8C2B776C7BC0A2076CEBC69FFAB5338EDF2E741D261C502E69F4A078114618C7D24D6B77E9F01" +
             "96A04852B0FD814E96CD9A8314470455C34F3FBC4CE4E46ADE9E1CFB2CE0DD2744801B14F00DA3229BBA108A9EA2BF7D3177" +
-            "89FBF8E939BCE0267321EDF4DBF4E5536C90D3FB6709A3FDBC3FBF6E06E0D06BED3F10B45733496E1E5F907440E973DF2132" +
-            "AE3C5E87694CFE9314AA3129B67C08553CD2A4BFE3390523A65346AA71D5E66207FF0AEB9E39685753DE8733539A5DE9ED76" +
-            "C8ABE97D209476F60DE1";
+            "89FBF8E939BCE0267321EDF4DBF4E5536C90D3FB6709A3FDBC3FBF6E06E0D06BED3F10B45733496E1E5F907440E57E3AD595" +
+            "4890DAE08FB85B342BC04E3CA377D50983DDDE328C86E592F836E5CDF8124CF8AD23807663B744774E5870C6DAE593D23F43" +
+            "85481E1995C076ED0EE1";
 
         private const string MultisigBlob =
             "1200002400000008201B007A12016140000000001E848068400000000000001873008114618C7D24D6B77E9F0196A04852B0" +
@@ -77,7 +84,7 @@ namespace Xrpl.Tests.Wallet.Tests
             var sponsorPart = Sponsor.SignAsSponsor(preparedDict);
 
             JsonObject submitterTx = prepared.DeepClone().AsObject();
-            byte[] preimage = SponsorSigningHelper.GetSigningPreimage(submitterTx);
+            byte[] preimage = global::Xrpl.AddressCodec.Utils.FromHex(XrplBinaryCodec.EncodeForSigning(submitterTx));
             submitterTx["TxnSignature"] = XrplKeypairs.Sign(preimage, Submitter.PrivateKey);
             string submitterBlob = XrplBinaryCodec.Encode(submitterTx);
 

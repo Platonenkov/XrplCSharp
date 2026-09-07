@@ -14,7 +14,7 @@ namespace Xrpl.Wallet
     /// A sponsored transaction carries the common fields Sponsor and SponsorFlags
     /// (spfSponsorFee = 1, spfSponsorReserve = 2) and, when the sponsorship requires it,
     /// the sponsor's co-signature: SponsorSignature (inner STObject with
-    /// SigningPubKey + TxnSignature over the same preimage as the main signature).
+    /// SigningPubKey + TxnSignature over the same transaction, under the sponsor's own prefix).
     ///
     /// Signing patterns (analogous to LoanSet broker/counterparty):
     ///
@@ -89,11 +89,11 @@ namespace Xrpl.Wallet
             => CoSigningEngine.FinalizeAsSubmitter(partiallySignedBlob, submitterWallet, "SponsorSignature");
 
         /// <summary>
-        /// Computes the signing preimage bytes for a sponsored transaction.
-        /// Both the submitter and the sponsor sign the same preimage.
+        /// Computes the bytes the sponsor signs into SponsorSignature: the transaction under the
+        /// sponsor prefix, which since fixCleanup3_4_0 is not what the submitter signs.
         /// </summary>
         public static byte[] GetSigningPreimage(JsonObject txJson)
-            => CoSigningEngine.GetSigningPreimage(txJson);
+            => CoSigningEngine.GetSigningPreimage(txJson, CoSigningEngine.PrefixFor("SponsorSignature"));
 
         internal static void VerifySponsorMatches(JsonObject tx, XrplWallet sponsorWallet)
         {

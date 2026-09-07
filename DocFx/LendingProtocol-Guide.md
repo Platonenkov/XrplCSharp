@@ -57,7 +57,7 @@ A **Loan** is a ledger object representing an active loan between a broker and a
 
 ### CounterpartySignature
 
-`LoanSet` is a special transaction that requires **two signatures**: the broker (submitter) signs the transaction normally, and the borrower (counterparty) provides a `CounterpartySignature`. Both parties sign the same transaction preimage.
+`LoanSet` is a special transaction that requires **two signatures**: the broker (submitter) signs the transaction normally, and the borrower (counterparty) provides a `CounterpartySignature`. Both sign the same transaction, each under its own hash prefix since rippled's `fixCleanup3_4_0`.
 
 ### Number Type
 
@@ -328,7 +328,7 @@ await client.SubmitRequest(fullySigned.TxBlob);
 
 ### Multisig Borrower (Counterparty with a SignerList)
 
-`CounterpartySignature` takes the multisig form when the borrower is a multisig account: an empty `SigningPubKey` and a `Signers` array that the node checks against the **counterparty's** SignerList, over the same multisign preimage as `tx.Signers`. Each signer of the borrower's list signs with the standard multisign call; the composer places the entries.
+`CounterpartySignature` takes the multisig form when the borrower is a multisig account: an empty `SigningPubKey` and a `Signers` array that the node checks against the **counterparty's** SignerList, under the counterparty multisign prefix, which since `fixCleanup3_4_0` is not the one `tx.Signers` uses. Each signer of the borrower's list signs with the standard multisign call - the SDK sees that the broker signs single and works the side out for itself - and the composer places the entries.
 
 ```csharp
 // The fee covers one base fee per counterparty signer (rippled LoanSet::calculateBaseFee),
@@ -359,7 +359,7 @@ A signer that appears in more than one SignerList (the broker's, the sponsor's, 
 
 ### Key Points
 
-- Both parties sign the **same** preimage (the transaction serialized for signing, without any signature fields)
+- Both parties sign the **same transaction** (serialized for signing, without any signature fields), each under the hash prefix of its role
 - The signing preimage uses the **broker's** `SigningPubKey` (the submitting account)
 - `CounterpartySignature` is an STObject with `isSigningField = false` — it is excluded from the signing preimage
 - `Autofill` automatically calculates the correct fee for LoanSet (includes CounterpartySignature overhead)

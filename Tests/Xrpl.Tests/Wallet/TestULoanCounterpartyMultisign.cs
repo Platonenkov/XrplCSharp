@@ -73,7 +73,8 @@ namespace XrplTests.Xrpl.Wallet
             {
                 JsonObject signer = entry["Signer"].AsObject();
                 string account = signer["Account"].GetValue<string>();
-                byte[] preimage = global::Xrpl.AddressCodec.Utils.FromHex(XrplBinaryCodec.EncodeForMultiSigning(forSigning, account));
+                byte[] preimage = global::Xrpl.AddressCodec.Utils.FromHex(XrplBinaryCodec.EncodeForMultiSigning(
+                    forSigning, account, global::Xrpl.BinaryCodec.Hashing.HashPrefix.CounterpartyTransactionMultiSig));
                 Assert.IsTrue(
                     XrplKeypairs.Verify(preimage, signer["TxnSignature"].GetValue<string>(), signer["SigningPubKey"].GetValue<string>()),
                     $"the entry of {account} must verify over the multisign preimage");

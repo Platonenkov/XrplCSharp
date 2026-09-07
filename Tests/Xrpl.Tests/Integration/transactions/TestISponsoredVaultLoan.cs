@@ -12,6 +12,7 @@ using Xrpl.Client.Exceptions;
 using Xrpl.Client.Json;
 using Xrpl.Models;
 using Xrpl.Models.Common;
+using Xrpl.Models.Ledger;
 using Xrpl.Models.Methods;
 using Xrpl.Models.Transactions;
 using Xrpl.Sugar;
@@ -56,12 +57,15 @@ public class TestISponsoredVaultLoan : TestILoanBase
     }
 
     [TestInitialize]
-    public void CheckSponsorAmendment()
+    public async Task CheckSponsorAmendment()
     {
         if (!sponsorAmendmentActive)
         {
             Assert.Inconclusive("Sponsor amendment (XLS-68) is not enabled on the test node.");
         }
+
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+        
     }
 
     [ClassCleanup]
@@ -448,6 +452,14 @@ public class TestISponsoredVaultLoan : TestILoanBase
         await OpenSponsorshipAsync(sponsor, borrower);
         await OpenSponsorshipAsync(sponsor, broker);
 
+        // Since fixCleanup3_4_0 a loan may only be impaired once a payment is actually late
+        // ("Cannot impair a loan that is not late", LoanManage::preclaim), which the default
+        // schedule puts one payment interval after the loan starts.
+        LedgerEntryResponse loanEntry = await client.LedgerEntry(new LedgerEntryRequest { Index = loanId }).Typed();
+        DateTime paymentDue = (loanEntry?.Node as LOLoan)?.NextPaymentDueDate
+            ?? throw new RippleException("the Loan carries no NextPaymentDueDate");
+        await IntegrationTestConfig.WaitForCloseTimeAsync(client, paymentDue, nodeType);
+
         await SubmitSponsoredAsync(new LoanManage
         {
             Account = broker.ClassicAddress,
@@ -455,12 +467,15 @@ public class TestISponsoredVaultLoan : TestILoanBase
             Flags = LoanManageFlags.tfLoanImpair,
         }, broker, sponsor);
 
-        // The full principal: anything less is tecINSUFFICIENT_PAYMENT
+        // The full principal: anything less is tecINSUFFICIENT_PAYMENT. The flag is not optional
+        // here: the wait above made the payment late on purpose, and rippled refuses an unflagged
+        // payment on an overdue loan with tecEXPIRED ("Use the tfLoanLatePayment transaction flag").
         await SubmitSponsoredAsync(new LoanPay
         {
             Account = borrower.ClassicAddress,
             LoanID = loanId,
             Amount = new Currency { Value = "10000000", CurrencyCode = "XRP" },
+            Flags = LoanPayFlags.tfLoanLatePayment,
         }, borrower, sponsor);
 
         await SubmitSponsoredAsync(new LoanDelete

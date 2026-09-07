@@ -33,6 +33,13 @@ namespace Xrpl.Tests.Wallet.Tests
             ["SponsorFlags"] = SpfSponsorFee | SpfSponsorReserve,
         };
 
+        /// <summary>
+        /// What the submitter's own TxnSignature covers. Since fixCleanup3_4_0 that is no longer
+        /// what the sponsor signs: the two preimages differ in their four-byte prefix.
+        /// </summary>
+        private static byte[] SubmitterPreimage(JsonObject tx) =>
+            global::Xrpl.AddressCodec.Utils.FromHex(XrplBinaryCodec.EncodeForSigning(tx));
+
         [TestMethod]
         public void TestUSignSponsored_V1_BothSignaturesVerify()
         {
@@ -57,9 +64,9 @@ namespace Xrpl.Tests.Wallet.Tests
             byte[] preimage = SponsorSigningHelper.GetSigningPreimage(preimageTx);
 
             Assert.IsTrue(XrplKeypairs.Verify(preimage, sponsorSig["TxnSignature"]!.GetValue<string>(), sponsor.PublicKey),
-                "SponsorSignature must verify over the transaction preimage.");
-            Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey),
-                "Submitter TxnSignature must verify over the same preimage.");
+                "SponsorSignature must verify over the sponsor preimage.");
+            Assert.IsTrue(XrplKeypairs.Verify(SubmitterPreimage(preimageTx), decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey),
+                "Submitter TxnSignature must verify over the transaction preimage.");
         }
 
         [TestMethod]
@@ -89,9 +96,9 @@ namespace Xrpl.Tests.Wallet.Tests
             byte[] preimage = SponsorSigningHelper.GetSigningPreimage(preimageTx);
 
             Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["SponsorSignature"]!["TxnSignature"]!.GetValue<string>(), sponsor.PublicKey),
-                "Combined SponsorSignature must verify over the shared preimage.");
-            Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey),
-                "Combined TxnSignature must verify over the shared preimage.");
+                "Combined SponsorSignature must verify over the sponsor preimage.");
+            Assert.IsTrue(XrplKeypairs.Verify(SubmitterPreimage(preimageTx), decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey),
+                "Combined TxnSignature must verify over the transaction preimage.");
         }
 
         [TestMethod]
@@ -116,7 +123,7 @@ namespace Xrpl.Tests.Wallet.Tests
             byte[] preimage = SponsorSigningHelper.GetSigningPreimage(preimageTx);
 
             Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["SponsorSignature"]!["TxnSignature"]!.GetValue<string>(), sponsor.PublicKey));
-            Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey));
+            Assert.IsTrue(XrplKeypairs.Verify(SubmitterPreimage(preimageTx), decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey));
         }
 
         [TestMethod]

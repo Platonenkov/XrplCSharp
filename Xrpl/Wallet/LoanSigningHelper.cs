@@ -196,11 +196,11 @@ namespace Xrpl.Wallet
         }
 
         /// <summary>
-        /// Computes the signing preimage bytes for a LoanSet transaction.
-        /// Both broker and borrower sign the same preimage.
+        /// Computes the bytes the borrower signs into CounterpartySignature: the transaction
+        /// under the counterparty prefix, which since fixCleanup3_4_0 is not what the broker signs.
         /// </summary>
         internal static byte[] GetSigningPreimage(JsonObject txJson)
-            => CoSigningEngine.GetSigningPreimage(txJson);
+            => CoSigningEngine.GetSigningPreimage(txJson, CoSigningEngine.PrefixFor("CounterpartySignature"));
 
     }
 }
