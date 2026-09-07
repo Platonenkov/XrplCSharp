@@ -208,12 +208,21 @@ public class Connection
 
         /// <summary>
         /// Gets or sets a value indicating whether to enable periodic background health monitoring of the WebSocket connection.<br/>
-        /// When enabled, the connection state is checked every 20 seconds. If the WebSocket is detected as Closed or Aborted,
-        /// or if no data has been received for more than 60 seconds, an automatic reconnection is triggered.<br/>
+        /// When enabled, the local connection state is checked every <see cref="HealthCheckInterval"/>. If the WebSocket is
+        /// detected as no longer Open, an automatic reconnection is triggered.<br/>
         /// This check does not send any network requests — it only inspects the local connection state.<br/>
         /// Automatically enabled when <see cref="UseCustomPing"/> is set to <see langword="true"/>.<br/>
         /// Default: <see langword="false"/>.
         /// </summary>
+        /// <remarks>
+        /// On its own this detects only a socket the runtime already knows is gone. A peer that vanished without
+        /// closing leaves the socket Open, and the only signal for that is silence - which is a signal only when
+        /// something is expected to arrive. That is what <see cref="UseCustomPing"/> adds: keepalive pings whose
+        /// answers keep the activity clock moving, so <see cref="InactivityTimeout"/> can mean "the node stopped
+        /// answering". Without pings an idle connection - no subscriptions, no requests - receives nothing at all,
+        /// and silence would declare a healthy socket dead every <see cref="InactivityTimeout"/>; so the inactivity
+        /// check runs only when <see cref="UseCustomPing"/> is enabled.
+        /// </remarks>
         public bool UseCheckHealth { get; set; } = false;
 
         /// <summary>
@@ -232,13 +241,16 @@ public class Connection
         /// <summary>
         /// Gets or sets how long a connection may go without any inbound activity before the health
         /// check treats it as dead and hands it to the fast-reconnect path.<br/>
+        /// Applies only when <see cref="UseCustomPing"/> is enabled.<br/>
         /// Default: 60 seconds, the threshold this check has always used.
         /// </summary>
         /// <remarks>
         /// A socket whose peer vanished stays <c>Open</c> until the next I/O, so silence is the only
-        /// signal available without sending traffic. Exposed together with
-        /// <see cref="HealthCheckInterval"/> so the fast-reconnect path is reachable from a test in
-        /// under a second instead of over a minute.
+        /// signal that reaches the client - and it is a signal only while keepalive pings are being
+        /// sent, because an idle connection with no subscriptions receives nothing by design. With
+        /// <see cref="UseCustomPing"/> off this value is not consulted; see the remarks on
+        /// <see cref="UseCheckHealth"/>. Exposed together with <see cref="HealthCheckInterval"/> so
+        /// the fast-reconnect path is reachable from a test in under a second instead of over a minute.
         /// </remarks>
         public TimeSpan InactivityTimeout { get; set; } = TimeSpan.FromSeconds(60);
 
