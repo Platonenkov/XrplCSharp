@@ -376,6 +376,17 @@ namespace Xrpl.Client
                     Dispose();
                 return;
             }
+            catch (Exception) when (_cancellationToken.IsCancellationRequested || _isIntentionalDisconnect)
+            {
+                // The handshake was cancelled by this side - the connect-attempt timer, or a
+                // takeover closing a socket it took - and whoever cancelled it has reported
+                // already. Not every runtime says so with OperationCanceledException: the browser's
+                // ClientWebSocket throws a WebSocketException ("ConnectFailure") for a cancelled
+                // connect, which used to reach the connection-error callback as a second failure
+                // of the same attempt, with a second OnDisconnect behind it.
+                _ws?.Dispose();
+                _ws = null;
+            }
             catch (Exception ex) when (IsNetworkException(ex))
             {
                 // Network-related exception during connection handshake - treat as NetworkDrop
@@ -663,20 +674,22 @@ namespace Xrpl.Client
                     await CallOnDisconnectedAsync(WebSocketCloseStatus.NormalClosure, "Client disconnected").ConfigureAwait(false);
                     return;
                 }
-                
-                // Check if this is a network exception (even with nested HttpRequestException)
-                // before surfacing via error callback
-                if (IsNetworkException(ex))
+
+                // A network exception (even with a nested HttpRequestException) is a drop. So is
+                // any WebSocketException in the browser: its ClientWebSocket surfaces one kind of
+                // failure for an open socket - the transport going away - and says so with an empty
+                // message and no HResult, which the pattern check cannot recognise.
+                if (IsNetworkException(ex) || OperatingSystem.IsBrowser())
                 {
                     FailureReason = SocketFailureReason.NetworkDrop;
                     await CallOnDisconnectedAsync(WebSocketCloseStatus.EndpointUnavailable, "Network error").ConfigureAwait(false);
                     return;
                 }
-                
-                // Not a network exception - surface the error
-                FailureReason = SocketFailureReason.Unknown;
-                _onConnectionError?.Invoke(ex, this);
-                await CallOnDisconnectedAsync(WebSocketCloseStatus.EndpointUnavailable, "WebSocket error: " + ex.Message).ConfigureAwait(false);
+
+                // Not a network exception. Reported as the close it is, and only as that: the
+                // connection-error callback is for a handshake that failed, and an established
+                // connection that fails is a closed one - see ReportFailureAsClose.
+                await ReportFailureAsCloseAsync("WebSocket error: " + Describe(ex)).ConfigureAwait(false);
             }
             catch (Exception ex) when (IsNetworkException(ex))
             {
@@ -696,9 +709,8 @@ namespace Xrpl.Client
                     await CallOnDisconnectedAsync(WebSocketCloseStatus.NormalClosure, "Client disconnected").ConfigureAwait(false);
                     return;
                 }
-                FailureReason = SocketFailureReason.Unknown;
-                _onConnectionError?.Invoke(ex, this);
-                await CallOnDisconnectedAsync(WebSocketCloseStatus.EndpointUnavailable, "Unknown error: " + ex.Message).ConfigureAwait(false);
+
+                await ReportFailureAsCloseAsync("Unknown error: " + Describe(ex)).ConfigureAwait(false);
             }
             finally
             {
@@ -751,6 +763,39 @@ namespace Xrpl.Client
             _onMessageString?.Invoke(Encoding.UTF8.GetString(result), this);
         }
 
+
+        /// <summary>
+        /// Reports a failure of an established connection - one whose receive loop was running -
+        /// as the close it is.
+        /// </summary>
+        /// <remarks>
+        /// It used to be reported twice: through the connection-error callback, which is written
+        /// for a handshake that failed and so announced "Initial connection failed" with a second
+        /// <c>OnDisconnect</c> behind it, and then through the close callback with the real close
+        /// code. One event, one report: the close callback classifies the failure from
+        /// <see cref="FailureReason"/>, announces the session end once and starts the reconnect.
+        /// </remarks>
+        private Task ReportFailureAsCloseAsync(string description)
+        {
+            FailureReason = SocketFailureReason.Unknown;
+            return CallOnDisconnectedAsync(WebSocketCloseStatus.EndpointUnavailable, description);
+        }
+
+        /// <summary>
+        /// The exception's message, or something in its place when the runtime gives none - the
+        /// browser's <see cref="WebSocketException"/> carries an empty message and only an error code.
+        /// </summary>
+        private static string Describe(Exception ex)
+        {
+            if (!string.IsNullOrWhiteSpace(ex.Message))
+            {
+                return ex.Message;
+            }
+
+            return ex is WebSocketException wsEx
+                ? $"{wsEx.WebSocketErrorCode} ({ex.GetType().Name})"
+                : ex.GetType().Name;
+        }
 
         private async Task CallOnDisconnectedAsync(WebSocketCloseStatus? closeStatus = null, string? closeDescription = null)
         {

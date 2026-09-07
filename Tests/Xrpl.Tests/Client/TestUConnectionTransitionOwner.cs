@@ -3,6 +3,7 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -742,6 +743,101 @@ namespace Xrpl.Tests
             Assert.IsTrue(
                 clock.Elapsed < TimeSpan.FromSeconds(2),
                 $"DisconnectAndWaitAsync on a disconnected client waited {clock.Elapsed.TotalSeconds:F1}s - on a completion source nobody completes.");
+        }
+
+        /// <summary>
+        /// A failure of an established connection that is not a network error - here a frame the
+        /// protocol forbids - is one event and must be reported once: one <c>OnDisconnect</c>, one
+        /// <c>OnSessionEnded</c>, a <c>RestoringConnection</c> that says the connection was lost.
+        /// The receive loop used to route it through the handshake-failure callback as well as
+        /// the close callback, which announced "Initial connection failed" for a connection that
+        /// had been up and in use, and a second <c>OnDisconnect</c> with no code behind it.
+        /// </summary>
+        [TestMethod]
+        public async Task TestFailureOfAnEstablishedConnectionIsReportedOnce()
+        {
+            using MalformedFrameServer server = new MalformedFrameServer(poisonFirst: 1);
+            _client = new XrplClient(server.Url, Options());
+
+            object gate = new object();
+            int disconnects = 0;
+            List<SessionEndReason> ended = new List<SessionEndReason>();
+            List<string> statuses = new List<string>();
+            int connectedAfterFailure = 0;
+
+            _client.OnDisconnect += (_, _) =>
+            {
+                Interlocked.Increment(ref disconnects);
+                return Task.CompletedTask;
+            };
+            _client.OnSessionEnded += (reason, _) =>
+            {
+                lock (gate)
+                {
+                    ended.Add(reason);
+                }
+
+                return Task.CompletedTask;
+            };
+            _client.OnConnectionStatus += info =>
+            {
+                lock (gate)
+                {
+                    statuses.Add($"[{info.ConnectionState}] {info.Message}");
+                    if (info.ConnectionState == XrpConnectionState.Connected && ended.Count > 0)
+                    {
+                        connectedAfterFailure++;
+                    }
+                }
+            };
+
+            await _client.connection.Connect(CancellationToken.None);
+            Assert.IsTrue(_client.connection.IsConnected(), "Precondition: connected to the poisoned server.");
+
+            // The first request is answered with the forbidden frame: the receive loop fails on a
+            // connection that is up and in use.
+            Exception failure = null;
+            try
+            {
+                await _client.connection.Request(
+                    new Dictionary<string, object> { { "command", "server_info" } },
+                    timeout: TimeSpan.FromSeconds(10));
+            }
+            catch (Exception error)
+            {
+                failure = error;
+            }
+
+            Assert.IsNotNull(failure, "The request written to the connection that failed must be rejected.");
+            Assert.IsNotInstanceOfType<Xrpl.Client.Exceptions.TimeoutException>(
+                failure,
+                "The request waited out its timeout instead of being rejected when the connection failed.");
+
+            await WaitUntilAsync(
+                () => { lock (gate) { return connectedAfterFailure > 0; } },
+                TimeSpan.FromSeconds(15),
+                "the reconnect loop to bring the client back on a healthy connection");
+
+            // Room for a second report to arrive, had one been made.
+            await Task.Delay(TimeSpan.FromMilliseconds(500));
+
+            lock (gate)
+            {
+                Assert.AreEqual(1, Volatile.Read(ref disconnects), "OnDisconnect must be raised once for one failed connection. Statuses: " + string.Join(" | ", statuses));
+                Assert.AreEqual(1, ended.Count, "OnSessionEnded must be raised once: " + string.Join(", ", ended));
+                Assert.AreEqual(SessionEndReason.ConnectionLost, ended[0]);
+                Assert.IsFalse(
+                    statuses.Any(s => s.Contains("Initial connection failed", StringComparison.Ordinal)),
+                    "A connection that was up and in use was reported as a failed initial connection: " + string.Join(" | ", statuses));
+                Assert.IsTrue(
+                    statuses.Any(s => s.StartsWith("[RestoringConnection]", StringComparison.Ordinal)),
+                    "The failure must be reported as RestoringConnection: " + string.Join(" | ", statuses));
+            }
+
+            Dictionary<string, object> response = await _client.connection
+                .Request(new Dictionary<string, object> { { "command", "server_info" } })
+                .Typed();
+            Assert.IsNotNull(response, "The client must be usable on the connection the loop brought up.");
         }
 
         /// <summary>

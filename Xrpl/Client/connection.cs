@@ -2323,6 +2323,18 @@ public class Connection
                 ConnectionCloseSeverity.Warning,
                 reconnect: BuildReconnectInfo());
         }
+        else if (failedSession?.IsOpened == true)
+        {
+            // The session had opened, so this is a connection that was lost, not one that never
+            // came up - whatever the socket's State says by now (Aborted, usually). Nothing in
+            // this class reports an established connection's failure this way any more (its
+            // receive loop reports a close), but the wording must not depend on that.
+            SetConnectionState(
+                XrpConnectionState.RestoringConnection,
+                $"Connection lost: {error.Message}. Reconnecting...",
+                ConnectionCloseSeverity.Warning,
+                reconnect: BuildReconnectInfo());
+        }
         else if (IsReconnectActive())
         {
             // During reconnect, use RestoringConnection with ReconnectInfo and Warning severity

@@ -164,6 +164,25 @@ Issue: https://github.com/StaticBit-io/XrplCSharp/issues/179 — продолж�
 `NotConnectedException()` без аргумента получает сообщение по умолчанию: «The client is not
 connected to a server…». `ImmediateFail` бросает с текстом, называющим политику.
 
+### 2.8. Найдено прогоном Blazor-клиента (WASM), исправлено здесь же
+
+- **Двойной отчёт по таймауту попытки.** В браузере отменённый `ConnectAsync` бросает
+  `WebSocketException` (ConnectFailure), а не `OperationCanceledException`, и общий `catch`
+  в `WebSocketClient.ConnectAsync` репортил его как вторую ошибку той же попытки. Теперь любое
+  исключение при `_cancellationToken.IsCancellationRequested || _isIntentionalDisconnect` —
+  это наша отмена, отчёт уже сделал тот, кто отменял.
+- **Обрыв установленного соединения как «Initial connection failed».** Receive-loop вызывал и
+  `_onConnectionError` (написан для провала handshake), и `CallOnDisconnected`. Теперь
+  единственный репортёр — `OnceClose` (`ReportFailureAsCloseAsync`); в браузере
+  `WebSocketException` на открытом сокете классифицируется как network drop, пустое сообщение
+  заменяется кодом ошибки (`Describe`). Страховка в `OnConnectionFailed`: открытая сессия
+  (`IsOpened`) описывается как «Connection lost», а не «Initial connection failed».
+- **Документация `UseCheckHealth`/`InactivityTimeout`** приведена к коду: детект тишины
+  требует `UseCustomPing`, и это намеренно (idle-соединение без подписок молчит по определению).
+- Тест `TestFailureOfAnEstablishedConnectionIsReportedOnce` с `MalformedFrameServer` (кадр с
+  зарезервированным opcode) — воспроизводим в .NET; отмена handshake в .NET приходит как OCE и
+  юнит-тестом не покрывается, проверена в Blazor.
+
 ## 3. Тесты
 
 Новые классы в `Tests/Xrpl.Tests/Client/` (MSTest, префикс `TestU`):
