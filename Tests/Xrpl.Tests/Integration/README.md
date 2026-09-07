@@ -13,11 +13,11 @@ dotnet test Tests/Xrpl.Tests/Xrpl.Tests.csproj --settings test.runsettings --fil
 docker compose -f .ci-config/docker-compose.ci.yml down
 ```
 
-Amendment-gated classes (`TestIBatch`, `TestIDelegateSet`) are skipped on the release node and need the nightly-develop environment instead:
+Amendment-gated classes (`TestIBatch`, `TestIDelegateSet`, `TestIClosedEndedVault`) are skipped on the release node and need the nightly-develop environment instead:
 
 ```bash
 docker compose -f .ci-config/docker-compose.batchv11.yml up -d --build
-dotnet test Tests/Xrpl.Tests/Xrpl.Tests.csproj --settings test.runsettings --filter "TestIBatch|TestIDelegateSet"
+dotnet test Tests/Xrpl.Tests/Xrpl.Tests.csproj --settings test.runsettings --filter "TestIBatch|TestIDelegateSet|TestIClosedEndedVault"
 docker compose -f .ci-config/docker-compose.batchv11.yml down
 ```
 

@@ -67,7 +67,7 @@ A vault is open-ended by default: deposits and withdrawals are accepted at any t
 | Investment | `RedemptionDate` | refused (`tecEXPIRED`) | refused (`tecTOO_SOON`) |
 | Redemption | never | refused (`tecEXPIRED`) | accepted |
 
-`VaultKind`, `SubscriptionDate` and `RedemptionDate` are set on `VaultCreate` and cannot be changed afterwards. A closed-ended vault requires both dates, with the redemption at least one minute and less than thirty years after the subscription; an open-ended vault may carry neither. The dates are `DateTime?` on the models and travel as seconds since the Ripple Epoch.
+`VaultKind`, `SubscriptionDate` and `RedemptionDate` are set on `VaultCreate` and cannot be changed afterwards. A closed-ended vault requires both dates, with the redemption at least three minutes and less than thirty years after the subscription; an open-ended vault may carry neither. The dates are `DateTime?` on the models and travel as seconds since the Ripple Epoch.
 
 ```csharp
 using Xrpl.Models.Ledger;   // VaultKind

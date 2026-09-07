@@ -67,7 +67,7 @@ Vault — это ledger-структура, которая хранит один
 | Investment | `RedemptionDate` | отклоняется (`tecEXPIRED`) | отклоняется (`tecTOO_SOON`) |
 | Redemption | никогда | отклоняется (`tecEXPIRED`) | разрешён |
 
-`VaultKind`, `SubscriptionDate` и `RedemptionDate` задаются в `VaultCreate` и позже не меняются. Закрытому vault нужны обе даты, причём redemption не раньше чем через минуту и строго раньше чем через тридцать лет после subscription; открытый vault не может нести ни одной. В моделях даты представлены как `DateTime?`, по сети передаются секундами от Ripple Epoch.
+`VaultKind`, `SubscriptionDate` и `RedemptionDate` задаются в `VaultCreate` и позже не меняются. Закрытому vault нужны обе даты, причём redemption не раньше чем через три минуты и строго раньше чем через тридцать лет после subscription; открытый vault не может нести ни одной. В моделях даты представлены как `DateTime?`, по сети передаются секундами от Ripple Epoch.
 
 ```csharp
 using Xrpl.Models.Ledger;   // VaultKind

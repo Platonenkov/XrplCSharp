@@ -444,11 +444,11 @@ namespace Xrpl.Tests.Models.Tests
             tx["VaultKind"] = (uint)Xrpl.Models.Ledger.VaultKind.ClosedEnded;
             await Assert.ThrowsExactlyAsync<Xrpl.Client.Exceptions.ValidationException>(() => Validation.ValidateVaultCreate(tx));
 
-            // kMinInvestmentPeriod <= gap < kMaxInvestmentPeriod
-            tx["RedemptionDate"] = 800000059u;
+            // kMinInvestmentPeriod (180 s since rippled #8151) <= gap < kMaxInvestmentPeriod
+            tx["RedemptionDate"] = 800000179u;
             await Assert.ThrowsExactlyAsync<Xrpl.Client.Exceptions.ValidationException>(() => Validation.ValidateVaultCreate(tx));
 
-            tx["RedemptionDate"] = 800000060u;
+            tx["RedemptionDate"] = 800000180u;
             await Validation.ValidateVaultCreate(tx);
 
             tx["RedemptionDate"] = 800000000u + 946708560u;

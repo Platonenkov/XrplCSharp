@@ -94,7 +94,7 @@ namespace Xrpl.Models.Transactions
 
         /// <summary>
         /// LendingProtocolV1_1: the start of a closed-ended vault's redemption phase. Fixed at creation,
-        /// and must lie at least one minute and less than thirty years after <see cref="SubscriptionDate"/>.
+        /// and must lie at least three minutes and less than thirty years after <see cref="SubscriptionDate"/>.
         /// Serialized as seconds since the Ripple Epoch.
         /// </summary>
         DateTime? RedemptionDate { get; set; }
@@ -211,8 +211,10 @@ namespace Xrpl.Models.Transactions
     {
         /// <summary>
         /// rippled <c>kMinInvestmentPeriod</c>: the smallest gap between SubscriptionDate and RedemptionDate.
+        /// Three minutes since rippled #8151, enough to originate a loan on the minimum payment interval
+        /// plus the redemption buffer; one minute in the original #7921.
         /// </summary>
-        private const long MinInvestmentPeriodSeconds = 60;
+        private const long MinInvestmentPeriodSeconds = 180;
 
         /// <summary>
         /// rippled <c>kMaxInvestmentPeriod</c>: thirty Gregorian years; the gap must stay below it.
@@ -256,7 +258,7 @@ namespace Xrpl.Models.Transactions
 
             long gap = (long)redemptionDate - subscriptionDate;
             if (gap < MinInvestmentPeriodSeconds || gap >= MaxInvestmentPeriodSeconds)
-                throw new ValidationException("VaultCreate: RedemptionDate must be at least one minute and less than thirty years after SubscriptionDate");
+                throw new ValidationException("VaultCreate: RedemptionDate must be at least three minutes and less than thirty years after SubscriptionDate");
         }
     }
 }

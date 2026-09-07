@@ -54,6 +54,9 @@ public static class AmendmentGuard
     /// </summary>
     public const string MPTokensV2 = "BE2D87DF21B690ED1497B593FDC013CC04276302380B1BD50A033DCF8DEFB2EB";
 
+    /// <summary>Amendment id of LendingProtocolV1_1 (sha512half of the name): closed-ended vaults.</summary>
+    public const string LendingProtocolV11 = "A360E2BFD775A5B0DCE1C36C16DF31B72735A57584FD163655D2F9564F8E7AC8";
+
     /// <summary>Amendment id of XChainBridge / XLS-38 (sha512half of the name).</summary>
     public const string XChainBridge = "C98D98EE9616ACD36E81FDEB8D41D349BF5F1B41DD64A0ABC1FE9AA5EA267E9C";
 
