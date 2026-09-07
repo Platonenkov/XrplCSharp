@@ -73,7 +73,7 @@ public class TestIClosedEndedVault : TestIVaultBase
         XrplWallet wallet = XrplWallet.Generate();
         await IntegrationTestConfig.TryFundWalletAsync(client, wallet, nodeType);
 
-        DateTime closeTime = await ValidatedCloseTimeAsync();
+        DateTime closeTime = await IntegrationTestConfig.ValidatedCloseTimeAsync(client);
         DateTime subscriptionDate = WholeSeconds(closeTime.AddSeconds(20));
         DateTime redemptionDate = subscriptionDate.AddSeconds(180);
 
@@ -101,12 +101,12 @@ public class TestIClosedEndedVault : TestIVaultBase
         ValidateResult(await SubmitAsync(Deposit(wallet, vaultId), wallet));
 
         // Investment phase: neither deposits nor withdrawals
-        await WaitForCloseTimeAsync(subscriptionDate);
+        await IntegrationTestConfig.WaitForCloseTimeAsync(client, subscriptionDate, nodeType);
         await AssertResultAsync("tecEXPIRED", () => SubmitAsync(Deposit(wallet, vaultId), wallet));
         await AssertResultAsync("tecTOO_SOON", () => SubmitAsync(Withdraw(wallet, vaultId), wallet));
 
         // Redemption phase: withdrawals are accepted
-        await WaitForCloseTimeAsync(redemptionDate);
+        await IntegrationTestConfig.WaitForCloseTimeAsync(client, redemptionDate, nodeType);
         ValidateResult(await SubmitAsync(Withdraw(wallet, vaultId), wallet));
     }
 
@@ -267,41 +267,6 @@ public class TestIClosedEndedVault : TestIVaultBase
     /// <summary>The wire carries whole seconds; a mark with sub-second ticks would never read back equal.</summary>
     private static DateTime WholeSeconds(DateTime value) =>
         new DateTime(value.Ticks - value.Ticks % TimeSpan.TicksPerSecond, DateTimeKind.Utc);
-
-    private static async Task<DateTime> ValidatedCloseTimeAsync()
-    {
-        LOLedger ledger = await client.Ledger(new LedgerRequest { LedgerIndex = new LedgerIndex(LedgerIndexType.Validated) }).Typed();
-        LedgerEntity entity = (LedgerEntity)ledger.LedgerEntity;
-        return entity.CloseTime ?? throw new InvalidOperationException("validated ledger has no close_time");
-    }
-
-    /// <summary>
-    /// Waits until the validated close time is strictly past <paramref name="target"/>: the phase
-    /// boundaries are inclusive on the earlier side (a close time equal to SubscriptionDate is
-    /// still the subscription phase), and the next transaction applies against that close time.
-    /// </summary>
-    private static async Task WaitForCloseTimeAsync(DateTime target)
-    {
-        TimeSpan budget = TimeSpan.FromSeconds(240);
-        System.Diagnostics.Stopwatch elapsed = System.Diagnostics.Stopwatch.StartNew();
-
-        while (true)
-        {
-            DateTime lastSeen = await ValidatedCloseTimeAsync();
-            if (lastSeen > target)
-                return;
-
-            if (elapsed.Elapsed >= budget)
-            {
-                Assert.Fail(
-                    $"the validated close time did not pass {target:O} within {budget.TotalSeconds:F0}s; " +
-                    $"last seen {lastSeen:O}, short by {(target - lastSeen).TotalSeconds:F1}s");
-            }
-
-            await IntegrationTestConfig.LedgerAcceptAsync(client, nodeType);
-            await Task.Delay(TimeSpan.FromSeconds(2));
-        }
-    }
 
     private static string GetCreatedObjectId(TransactionSummary result)
     {

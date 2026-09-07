@@ -336,11 +336,10 @@ public class TestISponsoredVaultLoan : TestILoanBase
         }, issuer, "issue tokens to the broker");
 
         TransactionSummary vaultResult = await client.SubmitAndWait(
-            await client.Autofill(new VaultCreate
-            {
-                Account = broker.ClassicAddress,
-                Asset = new IssuedCurrency { Currency = CurrencyCode, Issuer = issuer.ClassicAddress },
-            }), broker, true);
+            await client.Autofill(await BuildBrokerVaultAsync(
+                client,
+                broker.ClassicAddress,
+                new IssuedCurrency { Currency = CurrencyCode, Issuer = issuer.ClassicAddress })), broker, true);
         ValidateResult(vaultResult);
         string vaultId = GetCreatedObjectId(vaultResult, LedgerEntryType.Vault);
         Assert.IsNotNull(vaultId, "the VaultCreate must report the new Vault");

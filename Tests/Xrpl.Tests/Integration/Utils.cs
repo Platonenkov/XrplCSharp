@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using Xrpl.Client;
 using Xrpl.Client.Exceptions;
 using Xrpl.Models.Common;
+using Xrpl.Models.Ledger;
 using Xrpl.Models.Transactions;
 using Xrpl.Utils.Hashes;
 using Xrpl.Wallet;
@@ -444,6 +445,63 @@ namespace XrplTests.Xrpl.ClientLib.Integration
 
             var request = new BaseRequest { Command = "ledger_accept" };
             await client.AnyRequest(request);
+        }
+
+        /// <summary>
+        /// Close time of the latest validated ledger - the clock rippled's own time gates read.
+        /// </summary>
+        /// <remarks>
+        /// Wall-clock time is not a substitute. A standalone stand advances its ledger only when
+        /// something calls <c>ledger_accept</c>, so its close time trails the machine's clock by
+        /// however long the last ledger stayed open.
+        /// </remarks>
+        public static async Task<DateTime> ValidatedCloseTimeAsync(IXrplClient client)
+        {
+            LOLedger ledger = await client.Ledger(new LedgerRequest { LedgerIndex = new LedgerIndex(LedgerIndexType.Validated) }).Typed();
+            LedgerEntity entity = (LedgerEntity)ledger.LedgerEntity;
+            return entity.CloseTime ?? throw new InvalidOperationException("validated ledger has no close_time");
+        }
+
+        /// <summary>
+        /// Waits until the validated close time is strictly past <paramref name="target"/>.
+        /// </summary>
+        /// <remarks>
+        /// Strictly: rippled's time gates are <c>now &gt; mark</c> (<c>after()</c> in View.cpp), so a
+        /// close time equal to the mark is still too early, and standalone close times move in
+        /// coarse steps that land on equality readily.
+        /// <para>
+        /// Bounded, because a ledger that stops advancing is a node failure, and a test that waits
+        /// on it forever reports nothing. The failure names the last close time seen and how far
+        /// short of the mark it was, which separates a stalled node from a mark set too far ahead.
+        /// </para>
+        /// </remarks>
+        public static async Task WaitForCloseTimeAsync(
+            IXrplClient client,
+            DateTime target,
+            TestNodeType? nodeType = null,
+            TimeSpan? budget = null)
+        {
+            TimeSpan limit = budget ?? TimeSpan.FromSeconds(120);
+            System.Diagnostics.Stopwatch elapsed = System.Diagnostics.Stopwatch.StartNew();
+
+            while (true)
+            {
+                DateTime lastSeen = await ValidatedCloseTimeAsync(client);
+                if (lastSeen > target)
+                    return;
+
+                if (elapsed.Elapsed >= limit)
+                {
+                    Assert.Fail(
+                        $"the validated close time did not pass {target:O} within {limit.TotalSeconds:F0}s; " +
+                        $"last seen {lastSeen:O}, short by {(target - lastSeen).TotalSeconds:F1}s");
+                }
+
+                // The standalone stand has a sidecar closing a ledger every few seconds, but a
+                // stand raised without one would never move; on a public network this is a no-op.
+                await LedgerAcceptAsync(client, nodeType);
+                await Task.Delay(TimeSpan.FromSeconds(2));
+            }
         }
 
         /// <summary>
