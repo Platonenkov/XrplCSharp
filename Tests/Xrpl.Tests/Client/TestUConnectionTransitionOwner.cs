@@ -378,12 +378,13 @@ namespace Xrpl.Tests
             // closing connections would have that failing for reasons that are not this test's.
             await _client.connection.Connect(CancellationToken.None);
 
-            Assert.IsTrue(
-                _client.connection.IsConnected(),
-                $"The client never reached the server after it stopped closing connections (state: {_client.connection.CurrentConnectionState}, connections seen: {server.Connections}).");
-            Assert.IsTrue(
-                server.Connections >= 4,
-                $"The server saw {server.Connections} connections; the client is connected before the closing ones were exhausted.");
+            // Connect() returns as soon as a socket is open, which can be before the server's close
+            // frame for it has even arrived - so the outcome is waited for, not asserted at once:
+            // the client must end up connected on a connection the server did not close.
+            await WaitUntilAsync(
+                () => server.Connections >= 4 && _client.connection.IsConnected(),
+                TimeSpan.FromSeconds(15),
+                $"the client to reach the server after it stopped closing connections (state: {_client.connection.CurrentConnectionState}, connections seen: {server.Connections})");
 
             Dictionary<string, object> response = await _client.connection
                 .Request(new Dictionary<string, object> { { "command", "server_info" } })
@@ -525,6 +526,222 @@ namespace Xrpl.Tests
                 () => _client.connection.IsConnected(),
                 TimeSpan.FromSeconds(30),
                 "the client to reconnect after the server came up");
+        }
+
+        /// <summary>
+        /// A <c>ChangeServer</c> that a <c>Disconnect()</c> overtakes before the switch is announced
+        /// still owes the consumer the end of the session it retired: the retirement silenced the
+        /// socket's own close callback, and the disconnect does not know the session.
+        /// </summary>
+        [TestMethod]
+        public async Task TestChangeServerSupersededBeforeAnnouncingStillAnnouncesTheSessionEnd()
+        {
+            _secondRippled = StartMock(_secondPort);
+            _client = new XrplClient(UrlOf(_firstPort), Options());
+            await _client.Connect();
+
+            object gate = new object();
+            List<SessionEndReason> ended = new List<SessionEndReason>();
+            bool disconnecting = false;
+
+            _client.OnSessionEnded += (reason, _) =>
+            {
+                lock (gate)
+                {
+                    ended.Add(reason);
+                }
+
+                return Task.CompletedTask;
+            };
+            _client.OnConnectionStatus += info =>
+            {
+                // The first thing ChangeServer reports, before it announces the session end. A
+                // Disconnect() from here takes over before the announcement.
+                if (info.ConnectionState == XrpConnectionState.Connecting &&
+                    info.Message.StartsWith("ChangeServer", StringComparison.Ordinal) &&
+                    !disconnecting)
+                {
+                    disconnecting = true;
+                    _ = _client.Disconnect();
+                }
+            };
+
+            Exception failure = null;
+            try
+            {
+                await _client.connection.ChangeServer(UrlOf(_secondPort));
+            }
+            catch (Exception error)
+            {
+                failure = error;
+            }
+
+            Assert.IsInstanceOfType<NotConnectedException>(failure, $"Expected NotConnectedException, got {failure?.GetType().Name ?? "no exception"}.");
+
+            await Task.Delay(TimeSpan.FromSeconds(1));
+
+            lock (gate)
+            {
+                Assert.AreEqual(1, ended.Count, "OnSessionEnded must be raised exactly once for the session the switch retired: " + string.Join(", ", ended));
+                Assert.AreEqual(SessionEndReason.ServerChanged, ended[0]);
+            }
+
+            Assert.IsFalse(_client.connection.IsConnected(), "The Disconnect() issued from the status handler must win.");
+        }
+
+        /// <summary>
+        /// A fast reconnect whose loop ran out of attempts must not start a second series: the
+        /// loop reported <c>Disconnected</c> and released its source, and the fast reconnect's own
+        /// wait ends with the "failed permanently" refusal. Read as a failure to retry, that
+        /// refusal used to buy another full run of attempts, and <c>StopAfterMaxAttempts</c> meant
+        /// nothing.
+        /// </summary>
+        [TestMethod]
+        public async Task TestFastReconnectDoesNotRestartAfterTheLoopGaveUp()
+        {
+            SilentOnPingServer silentServer = new SilentOnPingServer();
+            try
+            {
+                XrplClient.ClientOptions options = FastReconnectOptions();
+                options.StopAfterMaxAttempts = true;
+                options.MaxReconnectAttempts = 2;
+                options.ConnectionAcquisitionTimeout = TimeSpan.FromSeconds(20);
+
+                _client = new XrplClient(silentServer.Url, options);
+
+                object gate = new object();
+                bool retired = false;
+                int stoppedReports = 0;
+                List<string> restoringAfterStopped = new List<string>();
+
+                _client.OnConnectionStatus += info =>
+                {
+                    lock (gate)
+                    {
+                        if (info.ConnectionState == XrpConnectionState.RestoringConnection && !retired)
+                        {
+                            // The health check handed the silent connection to the fast reconnect;
+                            // take the server down so every attempt fails at the socket.
+                            retired = true;
+                            silentServer.Dispose();
+                            return;
+                        }
+
+                        if (info.ConnectionState == XrpConnectionState.Disconnected &&
+                            info.Message.StartsWith("Reconnection stopped", StringComparison.Ordinal))
+                        {
+                            stoppedReports++;
+                            return;
+                        }
+
+                        if (info.ConnectionState == XrpConnectionState.RestoringConnection && stoppedReports > 0)
+                        {
+                            restoringAfterStopped.Add(info.Message);
+                        }
+                    }
+                };
+
+                await _client.Connect();
+                Assert.IsTrue(_client.connection.IsConnected(), "Precondition: connected to the silent server.");
+
+                await WaitUntilAsync(
+                    () => { lock (gate) { return stoppedReports > 0; } },
+                    TimeSpan.FromSeconds(20),
+                    "the reconnect loop to give up after MaxReconnectAttempts");
+
+                // Room for a second series to report itself, had one been started.
+                await Task.Delay(TimeSpan.FromSeconds(3));
+
+                lock (gate)
+                {
+                    Assert.AreEqual(
+                        0,
+                        restoringAfterStopped.Count,
+                        "RestoringConnection was reported after the loop had given up: " + string.Join(" | ", restoringAfterStopped));
+                    Assert.AreEqual(1, stoppedReports, "The loop gave up more than once - a second series ran.");
+                }
+
+                Assert.AreEqual(XrpConnectionState.Disconnected, _client.connection.CurrentConnectionState);
+            }
+            finally
+            {
+                silentServer.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// <c>Disconnect()</c> then <c>Connect()</c> at once - the ordinary way to bounce a client.
+        /// The disconnect closes its socket in the background, and the close callback is what
+        /// announces <see cref="SessionEndReason.UserDisconnected"/>; a <c>Connect()</c> that
+        /// retired that session underneath would silence the callback and announce a loss of its
+        /// own instead.
+        /// </summary>
+        [TestMethod]
+        public async Task TestConnectRightAfterDisconnectKeepsTheUserDisconnectAnnouncement()
+        {
+            _client = new XrplClient(UrlOf(_firstPort), Options());
+            await _client.Connect();
+
+            object gate = new object();
+            List<SessionEndReason> ended = new List<SessionEndReason>();
+
+            _client.OnSessionEnded += (reason, _) =>
+            {
+                lock (gate)
+                {
+                    ended.Add(reason);
+                }
+
+                return Task.CompletedTask;
+            };
+
+            await _client.Disconnect();
+            await _client.Connect();
+            Assert.IsTrue(_client.connection.IsConnected(), "The client must be connected again.");
+
+            await Task.Delay(TimeSpan.FromSeconds(1));
+
+            lock (gate)
+            {
+                Assert.AreEqual(1, ended.Count, "The session must end exactly once: " + string.Join(", ", ended));
+                Assert.AreEqual(SessionEndReason.UserDisconnected, ended[0], "The session ended because the consumer disconnected, and the announcement must say so.");
+            }
+        }
+
+        /// <summary>
+        /// After a <c>Disconnect()</c> that took a handshake still in flight, a
+        /// <c>DisconnectAndWaitAsync</c> must return at once: the cancelled handshake reports no
+        /// close, so there is nothing to wait for - and a completion source installed for it would
+        /// never complete.
+        /// </summary>
+        [TestMethod]
+        public async Task TestDisconnectAndWaitAfterADisconnectDuringHandshakeReturnsAtOnce()
+        {
+            using TcpListener silent = new TcpListener(IPAddress.Loopback, 0);
+            silent.Start();
+            int port = ((IPEndPoint)silent.LocalEndpoint).Port;
+
+            _client = new XrplClient(UrlOf(port), Options());
+
+            Task connecting = _client.connection.Connect(CancellationToken.None);
+            await Task.Delay(TimeSpan.FromMilliseconds(300));
+            await _client.Disconnect();
+            try
+            {
+                await connecting;
+            }
+            catch (Exception)
+            {
+                // Expected: the handshake was cancelled by the disconnect.
+            }
+
+            Stopwatch clock = Stopwatch.StartNew();
+            await _client.DisconnectAndWaitAsync(TimeSpan.FromSeconds(5));
+            clock.Stop();
+
+            Assert.IsTrue(
+                clock.Elapsed < TimeSpan.FromSeconds(2),
+                $"DisconnectAndWaitAsync on a disconnected client waited {clock.Elapsed.TotalSeconds:F1}s - on a completion source nobody completes.");
         }
 
         /// <summary>

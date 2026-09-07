@@ -794,8 +794,24 @@ public class Connection
     /// Takes the session and socket out of their fields. Must be called with
     /// <see cref="_transitionLock"/> held.
     /// </summary>
+    /// <remarks>
+    /// Nothing is taken when there is no socket: the session then belongs to whoever took the
+    /// socket before - a <c>Disconnect()</c> whose close callback is about to announce
+    /// <see cref="SessionEndReason.UserDisconnected"/> - or to a close that has already been
+    /// announced. Retiring it here would silence that callback and hand the session to a caller
+    /// that would announce a reason of its own for an end that was somebody else's.
+    /// </remarks>
     private void DetachLocked(bool retireSession, out ConnectionSession? session, out WebSocketClient? socket)
     {
+        socket = ws;
+        ws = null;
+
+        if (socket == null)
+        {
+            session = null;
+            return;
+        }
+
         lock (_sessionLock)
         {
             session = _activeSession;
@@ -804,10 +820,15 @@ public class Connection
                 session?.MarkAsRetiring();
             }
         }
-
-        socket = ws;
-        ws = null;
     }
+
+    /// <summary>
+    /// Whether <paramref name="socket"/> will run its close callback once closed - which is only
+    /// true of a socket whose receive loop exists. A handshake that is cancelled reports nothing,
+    /// and a socket that is already closed has reported already.
+    /// </summary>
+    private static bool WillReportClose(WebSocketClient socket) =>
+        socket.State is WebSocketState.Open or WebSocketState.CloseSent or WebSocketState.CloseReceived;
 
     /// <summary>
     /// Retires the reconnect loop's state. Must be called with <see cref="_transitionLock"/>
@@ -1053,26 +1074,39 @@ public class Connection
             takeover.Session?.CompleteSession();
         }
 
-        // Notified after the takeover, not before it: a handler that answers this with
-        // Disconnect() has to win, and it can only win against a transition that has begun.
-        SetConnectionState(XrpConnectionState.Connecting, message: $"ChangeServer: Switching to {server}...");
-        ThrowIfSuperseded(generation);
+        string sessionEnded = $"Switched to {server}. Subscriptions from the previous connection are no longer in effect.";
 
-        // The takeover cleared ws before this sweep, on purpose: the sweep resumes consumer
-        // continuations - inline on this thread when there is no synchronization context - and a
-        // request issued from one of them must already see no usable connection (issue #177).
-        requestManager.RejectAllWithCancellation();
-        connectionManager.RejectAllAwaitingWithCancellation();
-        ThrowIfSuperseded(generation);
+        try
+        {
+            // Notified after the takeover, not before it: a handler that answers this with
+            // Disconnect() has to win, and it can only win against a transition that has begun.
+            SetConnectionState(XrpConnectionState.Connecting, message: $"ChangeServer: Switching to {server}...");
+            ThrowIfSuperseded(generation);
 
-        // The message processor went with the session, and its reader is let go of after the
-        // sweep, not before: consumers are released first, and this is the first yield of the
-        // switch - what a single-threaded host runs their continuations on.
-        await takeover.ProcessorExit;
-        ThrowIfSuperseded(generation);
+            // The takeover cleared ws before this sweep, on purpose: the sweep resumes consumer
+            // continuations - inline on this thread when there is no synchronization context - and
+            // a request issued from one of them must already see no usable connection (issue #177).
+            requestManager.RejectAllWithCancellation();
+            connectionManager.RejectAllAwaitingWithCancellation();
+            ThrowIfSuperseded(generation);
 
-        await WaitForPingToFinishAsync();
-        ThrowIfSuperseded(generation);
+            // The message processor went with the session, and its reader is let go of after the
+            // sweep, not before: consumers are released first, and this is the first yield of the
+            // switch - what a single-threaded host runs their continuations on.
+            await takeover.ProcessorExit;
+            ThrowIfSuperseded(generation);
+
+            await WaitForPingToFinishAsync();
+            ThrowIfSuperseded(generation);
+        }
+        catch
+        {
+            // Superseded before the switch was announced. The session was retired by the takeover,
+            // which silences its own close callback, and the operation that took over does not
+            // know it - so the announcement the consumer is owed goes out here, or never.
+            await NotifySessionEndedAsync(takeover.Session, SessionEndReason.ServerChanged, sessionEnded);
+            throw;
+        }
 
         // The consumer's subscriptions belonged to the session just retired and do not follow the
         // client to the new server. Nothing else on this path says so - the socket's own close
@@ -1080,10 +1114,7 @@ public class Connection
         // Connecting, which is what a first connection reports too. Announced before the new
         // connection is opened, so a consumer cannot see OnConnected for the new session and only
         // afterwards learn that the old one is gone.
-        await NotifySessionEndedAsync(
-            takeover.Session,
-            SessionEndReason.ServerChanged,
-            $"Switched to {server}. Subscriptions from the previous connection are no longer in effect.");
+        await NotifySessionEndedAsync(takeover.Session, SessionEndReason.ServerChanged, sessionEnded);
 
         // The handler above may have started something of its own; the target is written only by
         // the transition that still owns the connection.
@@ -1187,9 +1218,13 @@ public class Connection
             ConnectionCloseSeverity.Warning,
             reconnect: BuildReconnectInfo());
 
+        // Standing down before the session end is announced still owes that announcement: the
+        // takeover retired the session, which silences its own close callback, and whoever took
+        // over does not know the session - see the same catch in ChangeServer.
         if (!Owns(generation))
         {
             Debug.WriteLine($"{DateTime.Now}Fast reconnect superseded from the status handler");
+            await NotifySessionEndedAsync(takeover.Session, SessionEndReason.ConnectionLost, reason).ConfigureAwait(false);
             return;
         }
 
@@ -1200,6 +1235,7 @@ public class Connection
 
         if (!Owns(generation))
         {
+            await NotifySessionEndedAsync(takeover.Session, SessionEndReason.ConnectionLost, reason).ConfigureAwait(false);
             return;
         }
 
@@ -1210,15 +1246,11 @@ public class Connection
         // WaitForPingToFinishAsync.
         await WaitForPingToFinishAsync().ConfigureAwait(false);
 
-        if (!Owns(generation))
-        {
-            return;
-        }
-
         // Same as ChangeServer: the session being retired took the subscriptions with it, and the
         // socket's own close callback will be filtered out as retiring. The RestoringConnection
         // status above reports that the connection is being rebuilt, not that everything bound to
-        // the old one is gone - a consumer had to infer the second from the first.
+        // the old one is gone - a consumer had to infer the second from the first. Announced
+        // whether or not this path still owns the connection, for the reason given above.
         await NotifySessionEndedAsync(takeover.Session, SessionEndReason.ConnectionLost, reason)
             .ConfigureAwait(false);
 
@@ -1285,6 +1317,17 @@ public class Connection
             {
                 _isFastReconnectActive = false;
                 Debug.WriteLine($"{DateTime.Now}Fast reconnect settled by the reconnect loop: {ex.Message}");
+                return;
+            }
+
+            // The wait says the client gave up: the loop the failure callback started on this
+            // source ran out of attempts, reported Disconnected and released the source. Starting
+            // another loop here would run a second full series behind a state that said the first
+            // was the last, and StopAfterMaxAttempts would mean nothing.
+            if (ex is NotConnectedException)
+            {
+                _isFastReconnectActive = false;
+                Debug.WriteLine($"{DateTime.Now}Fast reconnect gave up with the reconnect loop: {ex.Message}");
                 return;
             }
 
@@ -1692,12 +1735,18 @@ public class Connection
                 MarkSocketAsUserInitiated(socketToClose);
                 socketToClose.SetIntentionalDisconnect();
 
-                if (_disconnectTcs == null || _disconnectTcs.Task.IsCompleted)
+                // Only for a socket whose close will be reported. A source installed for a
+                // handshake in flight is completed by nobody - the cancelled handshake reports
+                // nothing - and the next DisconnectAndWaitAsync would wait out its timeout on it.
+                if (WillReportClose(socketToClose))
                 {
-                    _disconnectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                }
+                    if (_disconnectTcs == null || _disconnectTcs.Task.IsCompleted)
+                    {
+                        _disconnectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    }
 
-                tcs = _disconnectTcs;
+                    tcs = _disconnectTcs;
+                }
             }
         }
 
@@ -1742,6 +1791,16 @@ public class Connection
             SetConnectionState(XrpConnectionState.Disconnected, message: "Disconnected by user request.");
         }
 
+        // Announced here as well as from the socket's close callback, which dedups. The callback
+        // alone is not enough: a Connect() issued right after this call installs a new session
+        // before the old socket's close is processed, and the callback then files it as a stale
+        // session and announces nothing - the consumer bounced the client and never heard that
+        // its subscriptions went with the old connection.
+        await NotifySessionEndedAsync(
+            takeover.Session,
+            SessionEndReason.UserDisconnected,
+            "Disconnected by user request. Subscriptions from this connection are no longer in effect.");
+
         return 0;
     }
 
@@ -1763,7 +1822,7 @@ public class Connection
         await takeover.ProcessorExit;
         await WaitForPingToFinishAsync();
 
-        if (socketToClose == null || tcs == null)
+        if (socketToClose == null)
         {
             // Nothing here to close - but another DisconnectAndWaitAsync may be mid-way, having
             // taken the socket already. This call promised to return once the socket is gone, so
@@ -1793,6 +1852,20 @@ public class Connection
         if (Owns(generation))
         {
             SetConnectionState(XrpConnectionState.Disconnected, message: "Disconnected by user request.");
+        }
+
+        // See Disconnect() for why this is announced here and not left to the close callback.
+        await NotifySessionEndedAsync(
+            takeover.Session,
+            SessionEndReason.UserDisconnected,
+            "Disconnected by user request. Subscriptions from this connection are no longer in effect.");
+
+        if (tcs == null)
+        {
+            // A handshake in flight: closing it reports nothing, so there is nothing to wait for
+            // once the cancellation is issued.
+            CloseSocketIntentionally(socketToClose);
+            return;
         }
 
         // Start disconnect async - it waits for receive loop which calls OnceClose
