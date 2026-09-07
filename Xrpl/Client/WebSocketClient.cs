@@ -34,6 +34,12 @@ namespace Xrpl.Client
         private readonly CancellationToken _cancellationToken;
         private Task? _receiveTask;
         private readonly SemaphoreSlim _disconnectLock = new SemaphoreSlim(1, 1);
+
+        // One message at a time. ClientWebSocket serializes frames, not messages: two messages
+        // larger than SendChunkSize sent concurrently could interleave their frames. The lock
+        // also gives a send that queued behind another one a place to notice that the socket was
+        // retired in the meantime - see SendMessageAsync.
+        private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
         private volatile bool _isIntentionalDisconnect;
         
         public SocketFailureReason FailureReason { get; private set; } = SocketFailureReason.None;
@@ -257,64 +263,98 @@ namespace Xrpl.Client
         }
 
         /// <summary>
-        /// Send a UTF8 string to the WebSocket server.
+        /// Sends a UTF-8 string to the WebSocket server, fire-and-forget.
         /// </summary>
+        /// <remarks>
+        /// A failure is reported through the error callback and nowhere else - this is the
+        /// keepalive's entry point, and a consumer's, and neither has a request to reject. A
+        /// caller that does have one uses <see cref="SendMessageAsync(byte[])"/> and observes the
+        /// task. Neither entry point ever reconnects: a send on a socket that is not open fails,
+        /// it does not call <see cref="Connect"/>. It used to - <c>ConnectAsync</c> on an already
+        /// used <see cref="ClientWebSocket"/> throws, the catch disposed the socket and raised
+        /// <c>OnConnectionError</c>, and the send went ahead regardless.
+        /// </remarks>
         /// <param name="message">The message to send</param>
         public void SendMessage(string message)
         {
-            SendMessageAsync(Encoding.UTF8.GetBytes(message));
+            _ = ReportSendFailureAsync(SendMessageAsync(Encoding.UTF8.GetBytes(message)));
+        }
+
+        private async Task ReportSendFailureAsync(Task send)
+        {
+            try
+            {
+                await send.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // The socket was cancelled underneath the send - a close the owner asked for.
+            }
+            catch (Exception e)
+            {
+                Debug.WriteLine($"{DateTime.Now}WebSocket send failed: {e.GetType().Name}: {e.Message}");
+                CallOnError(e);
+            }
         }
 
         /// <summary>
-        /// Send a byte array to the WebSocket server.
+        /// Sends a byte array to the WebSocket server. The returned task faults if the message
+        /// could not be written, so the owner of a request can reject it instead of leaving it to
+        /// its timeout.
         /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The write is issued synchronously when the send lock is free: everything up to the
+        /// first incomplete await of <see cref="ClientWebSocket.SendAsync(ArraySegment{byte}, WebSocketMessageType, bool, CancellationToken)"/>
+        /// runs on the caller's thread. <c>Connection</c> relies on that - it starts the send
+        /// under the lock its retirement paths take, so a retirement either finds the request not
+        /// yet sent, or already handed to the socket.
+        /// </para>
+        /// <para>
+        /// A send that queued behind another one re-checks the socket once it holds the lock: the
+        /// retirement marks the socket before it lets go of it, and that mark is what refuses a
+        /// message that would otherwise reach a server the client has left. Between that check and
+        /// the write there is no lock - a few instructions - and that is the residue this method
+        /// does not close.
+        /// </para>
+        /// </remarks>
         /// <param name="message">The data to send</param>
-        private async void SendMessageAsync(byte[] message)
+        /// <exception cref="InvalidOperationException">The socket is not open.</exception>
+        public async Task SendMessageAsync(byte[] message)
         {
-            if (_ws is null)
-                return;
-            if (_ws.State != WebSocketState.Open)
+            ClientWebSocket? socket = _ws;
+            if (socket is null || socket.State != WebSocketState.Open)
             {
-                try
-                {
-                    _ = Connect();
-                }
-                catch (Exception e)
-                {
-                    throw new Exception("Connection is not open.");
-                }
+                throw new InvalidOperationException("The WebSocket is not open; a send does not open it.");
             }
 
-            var messagesCount = (int)Math.Ceiling((double)message.Length / SendChunkSize);
-
-            for (var i = 0; i < messagesCount; i++)
+            await _sendLock.WaitAsync(_cancellationToken).ConfigureAwait(false);
+            try
             {
-                var offset = (SendChunkSize * i);
-                var count = SendChunkSize;
-                var lastMessage = ((i + 1) == messagesCount);
-
-                if ((count * (i + 1)) > message.Length)
+                if (_isIntentionalDisconnect || socket.State != WebSocketState.Open)
                 {
-                    count = message.Length - offset;
+                    throw new InvalidOperationException("The WebSocket was closed before the message could be written.");
                 }
 
-                try
+                int messagesCount = (int)Math.Ceiling((double)message.Length / SendChunkSize);
+
+                for (int i = 0; i < messagesCount; i++)
                 {
-                    await _ws.SendAsync(new ArraySegment<byte>(message, offset, count), WebSocketMessageType.Binary, lastMessage, _cancellationToken);
+                    int offset = SendChunkSize * i;
+                    int count = SendChunkSize;
+                    bool lastMessage = (i + 1) == messagesCount;
+
+                    if ((count * (i + 1)) > message.Length)
+                    {
+                        count = message.Length - offset;
+                    }
+
+                    await socket.SendAsync(new ArraySegment<byte>(message, offset, count), WebSocketMessageType.Binary, lastMessage, _cancellationToken).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
-                catch (Exception e)
-                {
-                    // The send is fire-and-forget (async void), so nothing can observe this exception:
-                    // the pending request just sits there until its RequestTimeout expires. Surface it
-                    // through the error callback - report-only, the connection itself is left alone.
-                    Debug.WriteLine($"{DateTime.Now}WebSocket send failed: {e.GetType().Name}: {e.Message}");
-                    CallOnError(e);
-                    return;
-                }
+            }
+            finally
+            {
+                _sendLock.Release();
             }
         }
 

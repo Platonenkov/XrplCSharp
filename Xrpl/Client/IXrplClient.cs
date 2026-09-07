@@ -260,9 +260,12 @@ namespace Xrpl.Client
         /// </para>
         /// <para>
         /// Throws <see cref="NotConnectedException"/> when the client gave up - a
-        /// handler that fails every time, or a server that never comes up.
-        /// <see cref="OperationCanceledException"/> means what it says and nothing else: the
-        /// caller's own <paramref name="cancellationToken"/> was cancelled.
+        /// handler that fails every time, or a server that never comes up - and when a
+        /// <see cref="Disconnect"/> issued while this call was connecting won: the client is down,
+        /// and this call did not connect it. <see cref="OperationCanceledException"/> means what
+        /// it says and nothing else: the caller's own <paramref name="cancellationToken"/> was
+        /// cancelled. A <c>ChangeServer</c> issued meanwhile does not fail this call - it returns
+        /// once the client is connected, wherever that switch took it.
         /// </para>
         /// </remarks>
         /// <param name="cancellationToken">Cancels the wait for a connection.</param>
@@ -685,6 +688,30 @@ namespace Xrpl.Client
         Task<T> Autofill<T>(T tx, int? signersCount = null, CancellationToken cancellationToken = default) where T : ITransactionRequest;
         Task<uint> GetLedgerIndex(CancellationToken cancellationToken = default);
         Task<string> GetXrpBalance(string address, CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Moves the client to another server: retires the current session, connects to
+        /// <paramref name="server"/> and reads its network id.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The switch is announced through <see cref="OnSessionEnded"/> with
+        /// <see cref="SessionEndReason.ServerChanged"/> before the new connection is opened; the
+        /// subscriptions held against the old connection do not follow the client.
+        /// </para>
+        /// <para>
+        /// A later <see cref="Disconnect"/>, <see cref="Connect"/> or <c>ChangeServer</c> - from
+        /// another thread, or from a handler this call runs - takes the connection over, and this
+        /// call stops where it is: <see cref="NotConnectedException"/> when a
+        /// <see cref="Disconnect"/> won, because the client is down;
+        /// <see cref="OperationCanceledException"/> when anything else won, because the client is
+        /// connecting, or connected, somewhere this call did not ask for. The old session is
+        /// retired either way.
+        /// </para>
+        /// </remarks>
+        /// <param name="server">The WebSocket URL of the server to move to.</param>
+        /// <param name="options">Options for the new connection; <c>null</c> keeps the current ones.</param>
+        /// <param name="cancellationToken">Cancels the wait for the new connection.</param>
         Task ChangeServer(string server, ClientOptions? options = null, CancellationToken cancellationToken = default);
 
         string EnsureClassicAddress(string address);

@@ -78,7 +78,15 @@ namespace Xrpl.Client.Exceptions
     /// </summary>
     public class NotConnectedException : XrplException
     {
-        public NotConnectedException(string message = null) : base(message)
+        /// <summary>
+        /// The message used when none is given. A bare <c>throw new NotConnectedException()</c>
+        /// used to carry the runtime's "Exception of type ... was thrown", which says nothing to a
+        /// consumer that classifies failures by their text.
+        /// </summary>
+        public const string DefaultMessage =
+            "The client is not connected to a server. Call Connect() first, or wait for the connection to be restored.";
+
+        public NotConnectedException(string message = null) : base(message ?? DefaultMessage)
         {
         }
     }
@@ -88,6 +96,10 @@ namespace Xrpl.Client.Exceptions
     public class DisconnectedException : XrplException
     {
         public DisconnectedException(string message) : base(message)
+        {
+        }
+
+        public DisconnectedException(string message, Exception? innerException) : base(message, innerException)
         {
         }
     }

@@ -11,8 +11,8 @@ namespace Xrpl.Tests
 {
     /// <summary>
     /// Concurrency smoke tests for the reconnect session — the <c>_reconnectCts</c> /
-    /// <c>_reconnectLoop</c> / <c>_reconnectAttempts</c> triple, which is now updated under a
-    /// shared lock.
+    /// <c>_reconnectLoopGeneration</c> / <c>_reconnectAttempts</c> triple, which is updated under
+    /// the transition lock together with the generation that owns the connection (issue #179).
     /// </summary>
     /// <remarks>
     /// <para>

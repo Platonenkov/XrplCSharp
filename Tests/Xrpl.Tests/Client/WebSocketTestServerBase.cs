@@ -55,6 +55,14 @@ namespace Xrpl.Tests
         protected abstract Task ServeAsync(NetworkStream stream);
 
         /// <summary>
+        /// Whether the server keeps accepting after its first client. The default serves one
+        /// client and holds that connection open until the server is disposed; a server that
+        /// answers <see langword="true"/> serves clients one after another, and each connection
+        /// ends when <see cref="ServeAsync"/> returns for it.
+        /// </summary>
+        protected virtual bool ServesManyClients => false;
+
+        /// <summary>
         /// The exception that ended the accept loop, if it ended badly. Recorded rather than
         /// swallowed so a broken server shows up as itself instead of as the caller's timeout.
         /// </summary>
@@ -75,20 +83,27 @@ namespace Xrpl.Tests
         {
             try
             {
-                using TcpClient client = await _listener.AcceptTcpClientAsync(Token).ConfigureAwait(false);
-                client.NoDelay = true;
-                NetworkStream stream = client.GetStream();
+                do
+                {
+                    using TcpClient client = await _listener.AcceptTcpClientAsync(Token).ConfigureAwait(false);
+                    client.NoDelay = true;
+                    NetworkStream stream = client.GetStream();
 
-                string request = await ReadUntilHeadersEndAsync(stream).ConfigureAwait(false);
-                string key = Helpers.GetHandshakeRequestKey(request);
-                byte[] response = Encoding.ASCII.GetBytes(Helpers.GetHandshakeResponse(Helpers.HashKey(key)));
-                await stream.WriteAsync(response, Token).ConfigureAwait(false);
-                await stream.FlushAsync(Token).ConfigureAwait(false);
+                    string request = await ReadUntilHeadersEndAsync(stream).ConfigureAwait(false);
+                    string key = Helpers.GetHandshakeRequestKey(request);
+                    byte[] response = Encoding.ASCII.GetBytes(Helpers.GetHandshakeResponse(Helpers.HashKey(key)));
+                    await stream.WriteAsync(response, Token).ConfigureAwait(false);
+                    await stream.FlushAsync(Token).ConfigureAwait(false);
 
-                await ServeAsync(stream).ConfigureAwait(false);
+                    await ServeAsync(stream).ConfigureAwait(false);
 
-                // Hold the connection open until the test disposes the server.
-                await Task.Delay(Timeout.InfiniteTimeSpan, Token).ConfigureAwait(false);
+                    if (!ServesManyClients)
+                    {
+                        // Hold the connection open until the test disposes the server.
+                        await Task.Delay(Timeout.InfiniteTimeSpan, Token).ConfigureAwait(false);
+                    }
+                }
+                while (ServesManyClients && !Token.IsCancellationRequested);
             }
             catch (OperationCanceledException)
             {
