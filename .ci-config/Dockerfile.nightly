@@ -10,7 +10,7 @@ RUN install -m 0755 -d /usr/share/keyrings \
 # rippled was renamed to xrpld on the develop branch; the nightly channel publishes it as the "xrpld" package.
 # The version must be pinned: the timestamp format changed from 14 to 12 digits mid-2026,
 # so Debian version ordering ranks old 14-digit builds above the newer 12-digit ones.
-ARG XRPLD_VERSION=3.4.0~b0+202608111815.26cc683e-1
+ARG XRPLD_VERSION=3.4.0~rc1+202609050006.e3c8996e-1
 RUN echo "deb [signed-by=/usr/share/keyrings/ripple-key.gpg] https://repos.ripple.com/repos/rippled-deb jammy nightly" > /etc/apt/sources.list.d/ripple.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends --allow-downgrades "xrpld=${XRPLD_VERSION}" \
