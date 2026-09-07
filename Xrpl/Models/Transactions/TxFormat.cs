@@ -502,6 +502,9 @@ namespace Xrpl.Models.Transaction
                     [Field.Scale] = Requirement.Optional,
                     [Field.Data] = Requirement.Optional,
                     [Field.DomainID] = Requirement.Optional,
+                    [Field.VaultKind] = Requirement.Optional,
+                    [Field.SubscriptionDate] = Requirement.Optional,
+                    [Field.RedemptionDate] = Requirement.Optional,
                 },
                 [BinaryCodec.Types.TransactionType.VaultSet] = new TxFormat
                 {
@@ -526,6 +529,7 @@ namespace Xrpl.Models.Transaction
                     [Field.Amount] = Requirement.Required,
                     [Field.Destination] = Requirement.Optional,
                     [Field.DestinationTag] = Requirement.Optional,
+                    [Field.CredentialIDs] = Requirement.Optional,
                 },
                 [BinaryCodec.Types.TransactionType.VaultClawback] = new TxFormat
                 {
@@ -560,6 +564,7 @@ namespace Xrpl.Models.Transaction
                     [Field.Amount] = Requirement.Required,
                     [Field.Destination] = Requirement.Optional,
                     [Field.DestinationTag] = Requirement.Optional,
+                    [Field.CredentialIDs] = Requirement.Optional,
                 },
                 [BinaryCodec.Types.TransactionType.LoanBrokerCoverClawback] = new TxFormat
                 {

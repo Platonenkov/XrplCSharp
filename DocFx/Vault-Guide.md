@@ -57,6 +57,33 @@ When a depositor adds assets, the vault issues shares as MPT tokens. The number 
 Defines how withdrawals are handled:
 - `0x0001` (`vaultStrategyFirstComeFirstServe`) — depositors can redeem any amount of assets provided they hold sufficient shares
 
+### Vault Kind (LendingProtocolV1_1)
+
+A vault is open-ended by default: deposits and withdrawals are accepted at any time. With the LendingProtocolV1_1 amendment a vault can instead be created closed-ended, with three phases fixed at creation:
+
+| Phase | Ends at | Deposits | Withdrawals |
+|-------|---------|----------|-------------|
+| Subscription | `SubscriptionDate` (inclusive) | accepted | accepted |
+| Investment | `RedemptionDate` | refused (`tecEXPIRED`) | refused (`tecTOO_SOON`) |
+| Redemption | never | refused (`tecEXPIRED`) | accepted |
+
+`VaultKind`, `SubscriptionDate` and `RedemptionDate` are set on `VaultCreate` and cannot be changed afterwards. A closed-ended vault requires both dates, with the redemption at least one minute and less than thirty years after the subscription; an open-ended vault may carry neither. The dates are `DateTime?` on the models and travel as seconds since the Ripple Epoch.
+
+```csharp
+using Xrpl.Models.Ledger;   // VaultKind
+
+VaultCreate vaultTx = new VaultCreate
+{
+    Account = wallet.ClassicAddress,
+    Asset = new IssuedCurrency { Currency = "XRP" },
+    VaultKind = (uint)VaultKind.ClosedEnded,
+    SubscriptionDate = DateTime.UtcNow.AddDays(7),
+    RedemptionDate = DateTime.UtcNow.AddDays(97),
+};
+```
+
+A node without the amendment refuses a `VaultCreate` that carries any of the three fields (`temDISABLED`). On the ledger object `VaultKind` is absent for an open-ended vault, whether it was created before the amendment or after it.
+
 ### Vault Flags
 
 Set only at creation time via `VaultCreate`:
@@ -292,6 +319,10 @@ Console.WriteLine($"Metadata: {vault.DataParsed?.Name}");
 | `ShareMPTID` | string | MPTokenIssuance ID for vault shares |
 | `WithdrawalPolicy` | uint? | Withdrawal strategy |
 | `Scale` | uint? | Decimal precision for share calculations |
+| `LEVersion` | uint? | Schema version (`VaultVersion`), absent on vaults created before cash-basis accounting |
+| `VaultKind` | uint? | `VaultKind.ClosedEnded` (1) for a closed-ended vault, absent otherwise |
+| `SubscriptionDate` | DateTime? | End of the subscription phase (closed-ended only) |
+| `RedemptionDate` | DateTime? | Start of the redemption phase (closed-ended only) |
 | `Data` | string | Hex-encoded metadata (max 256 bytes) |
 | `Sequence` | uint? | Creation transaction sequence |
 

@@ -82,10 +82,18 @@ namespace Xrpl.Models.Transactions
         /// <summary>PermissionedDomains: domain restricting who may hold this MPT.</summary>
         public string DomainID { get; set; }
 
-        /// <summary>ConfidentialTransfer: issuer ElGamal encryption public key (hex).</summary>
+        /// <summary>
+        /// ConfidentialTransfer: issuer ElGamal encryption public key (hex). Registered once; with
+        /// ConfidentialMPTKeyRotation active a different key replaces the current one and increments
+        /// the issuance's <c>IssuerKeyEpoch</c>, while the current key is refused (tecDUPLICATE).
+        /// </summary>
         public string IssuerEncryptionKey { get; set; }
 
-        /// <summary>ConfidentialTransfer: auditor ElGamal encryption public key (hex).</summary>
+        /// <summary>
+        /// ConfidentialTransfer: auditor ElGamal encryption public key (hex). Rotates the same way as
+        /// <see cref="IssuerEncryptionKey"/> (<c>AuditorKeyEpoch</c>). Before the amendment it could only
+        /// be registered together with the issuer key; with the amendment active it can also be added later.
+        /// </summary>
         public string AuditorEncryptionKey { get; set; }
     }
 

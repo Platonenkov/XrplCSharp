@@ -187,6 +187,10 @@ jobs:
         id: definitions
         continue-on-error: true
         run: |
+          # The runner starts this script with `bash -e`, and the diff exits 1 whenever it
+          # finds drift: errexit would end the step at the assignment below, before the
+          # report is echoed or recorded - the one case the step exists for.
+          set +e
           set -uo pipefail
           out=$(dotnet run --project Tools/GenerateEnums -- diff http://localhost:5005 2>&1)
           status=$?

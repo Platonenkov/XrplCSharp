@@ -1,13 +1,20 @@
-https://github.com/XRPLF/rippled/blob/3.3.0/include/xrpl/protocol/detail/transactions.macro
-sha  00a178fb92ca49521b937ae1a99d863765ea8a90
-date 2026-08-06T16:34:39Z
-tag  3.3.0
+https://github.com/XRPLF/rippled/blob/develop/include/xrpl/protocol/detail/transactions.macro
+sha  e3c8996e44921fe3b4e02c65cb41948848bcc7c5
+date 2026-09-05T00:06:14Z
 
 transactions.macro is vendored byte-identical to the ref above so that it can be
 re-verified with a plain diff:
 
-  curl -sSL https://raw.githubusercontent.com/XRPLF/rippled/00a178fb92ca49521b937ae1a99d863765ea8a90/include/xrpl/protocol/detail/transactions.macro \
+  curl -sSL https://raw.githubusercontent.com/XRPLF/rippled/e3c8996e44921fe3b4e02c65cb41948848bcc7c5/include/xrpl/protocol/detail/transactions.macro \
     | diff - Tests/Xrpl.Tests/Fixtures/transactions.macro
+
+Pinned to a develop commit rather than to a release tag, the way ledger_entries.macro
+is. Up to 3.3.0 the two agreed on transaction fields, so the tag was the simpler
+pin; since then develop has added fields the models carry ahead of a release
+(VaultCreate.VaultKind/SubscriptionDate/RedemptionDate, VaultWithdraw.CredentialIDs,
+LoanBrokerCoverWithdraw.CredentialIDs), and a tag would report them as fields the
+models invented. The sha is the commit the nightly stand is pinned to
+(.ci-config/Dockerfile.nightly), so the fixture and the stand describe the same build.
 
 Do not hand-edit it. When protocol-watch reports a change to this file upstream,
 replace it wholesale, update the sha above, and let TestUTxFormatConformance

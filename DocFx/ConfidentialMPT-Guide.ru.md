@@ -63,6 +63,7 @@ var set = new MPTokenIssuanceSet
 - ненулевой `TransferFee` **несовместим** со включением конфиденциальных балансов (`temBAD_TRANSFER_FEE`);
 - флаг `tifMPTCanHoldConfidentialBalance` в `ImmutableFlags` — при создании выпуска или в любой последующей транзакции — навсегда запрещает включение приватности;
 - `AuditorEncryptionKey` требует наличия `IssuerEncryptionKey`.
+- ключ регистрируется один раз. При активной поправке ConfidentialMPTKeyRotation `MPTokenIssuanceSet` с другим ключом заменяет его и увеличивает `IssuerKeyEpoch` / `AuditorKeyEpoch` на выпуске; текущий ключ отклоняется (`tecDUPLICATE`), а ключ аудитора можно зарегистрировать уже после ключа эмитента.
 
 ---
 
@@ -92,7 +93,7 @@ var set = new MPTokenIssuanceSet
 
 ## Объекты леджера
 
-- `LOMPTokenIssuance`: `IssuerEncryptionKey`, `AuditorEncryptionKey`, `ConfidentialOutstandingAmount` (decimal-строка — base-ten UInt64 поле), `ImmutableFlags`
+- `LOMPTokenIssuance`: `IssuerEncryptionKey`, `AuditorEncryptionKey`, `IssuerKeyEpoch` и `AuditorKeyEpoch` (счётчики ротаций, отсутствуют до первой ротации), `ConfidentialOutstandingAmount` (decimal-строка — base-ten UInt64 поле), `ImmutableFlags`
 - `LOMPToken`: поля конфиденциального баланса/inbox (зашифрованные блобы + счётчики)
 
 ---

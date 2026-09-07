@@ -63,6 +63,7 @@ Rules enforced by rippled preflight (mirrored by SDK validation):
 - a non-zero `TransferFee` **cannot** be combined with enabling confidential balances (`temBAD_TRANSFER_FEE`);
 - `tifMPTCanHoldConfidentialBalance` in `ImmutableFlags` — on the create or on any later set — permanently forbids enabling privacy;
 - an `AuditorEncryptionKey` requires an `IssuerEncryptionKey`.
+- a key is registered once. With the ConfidentialMPTKeyRotation amendment active, an `MPTokenIssuanceSet` carrying a different key rotates it and increments `IssuerKeyEpoch` / `AuditorKeyEpoch` on the issuance; the current key is refused (`tecDUPLICATE`), and an auditor key may then be registered after the issuer key.
 
 ---
 
@@ -92,7 +93,7 @@ All amounts encrypted under holder/issuer/auditor keys are supplied by the **pro
 
 ## Ledger Objects
 
-- `LOMPTokenIssuance`: `IssuerEncryptionKey`, `AuditorEncryptionKey`, `ConfidentialOutstandingAmount` (decimal string — a base-ten UInt64 field), `ImmutableFlags`
+- `LOMPTokenIssuance`: `IssuerEncryptionKey`, `AuditorEncryptionKey`, `IssuerKeyEpoch` and `AuditorKeyEpoch` (rotation counters, absent until the first rotation), `ConfidentialOutstandingAmount` (decimal string — a base-ten UInt64 field), `ImmutableFlags`
 - `LOMPToken`: confidential balance/inbox fields (encrypted blobs + counters)
 
 ---

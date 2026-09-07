@@ -33,6 +33,13 @@ namespace Xrpl.Models.Transactions
         /// An arbitrary tag to identify the destination. Optional.
         /// </summary>
         uint? DestinationTag { get; set; }
+
+        /// <summary>
+        /// Credentials (object IDs, 64 hex characters each) authorizing the withdrawal when the
+        /// <see cref="Destination"/> requires deposit authorization with credential-based preauth
+        /// (XLS-70). Maximum 8 entries.
+        /// </summary>
+        List<string> CredentialIDs { get; set; }
     }
 
     /// <inheritdoc cref="ILoanBrokerCoverWithdraw" />
@@ -59,6 +66,11 @@ namespace Xrpl.Models.Transactions
         /// <inheritdoc />
         [JsonPropertyName("DestinationTag")]
         public uint? DestinationTag { get; set; }
+
+        /// <inheritdoc />
+        [JsonPropertyName("CredentialIDs")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public List<string> CredentialIDs { get; set; }
     }
 
     /// <inheritdoc cref="ILoanBrokerCoverWithdraw" />
@@ -80,6 +92,11 @@ namespace Xrpl.Models.Transactions
         /// <inheritdoc />
         [JsonPropertyName("DestinationTag")]
         public uint? DestinationTag { get; set; }
+
+        /// <inheritdoc />
+        [JsonPropertyName("CredentialIDs")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public List<string> CredentialIDs { get; set; }
     }
 
     public partial class Validation
@@ -93,6 +110,11 @@ namespace Xrpl.Models.Transactions
 
             if (!tx.TryGetValue("Amount", out var amount) || amount is null)
                 throw new ValidationException("LoanBrokerCoverWithdraw: missing field Amount");
+
+            if (tx.TryGetValue("CredentialIDs", out var credentialIds) && credentialIds is not null)
+            {
+                CredentialsValidator.ValidateCredentialsList(credentialIds, "LoanBrokerCoverWithdraw", "CredentialIDs", isStringID: true);
+            }
         }
     }
 }

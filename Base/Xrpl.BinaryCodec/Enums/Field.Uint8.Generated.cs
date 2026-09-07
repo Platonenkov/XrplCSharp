@@ -16,5 +16,7 @@ namespace Xrpl.BinaryCodec.Enums
         public static readonly Uint8Field HookResult = new Uint8Field(nameof(HookResult), 18);
         public static readonly Uint8Field WasLockingChainSend = new Uint8Field(nameof(WasLockingChainSend), 19);
         public static readonly Uint8Field WithdrawalPolicy = new Uint8Field(nameof(WithdrawalPolicy), 20);
+        public static readonly Uint8Field ContractResult = new Uint8Field(nameof(ContractResult), 21);
+        public static readonly Uint8Field VaultKind = new Uint8Field(nameof(VaultKind), 22);
     }
 }
