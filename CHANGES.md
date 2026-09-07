@@ -20,7 +20,7 @@
   * **confidential MPT key rotation** (rippled #7915, ConfidentialMPTKeyRotation): `LOMPTokenIssuance` carries `IssuerKeyEpoch` and `AuditorKeyEpoch`, incremented each time `MPTokenIssuanceSet` replaces the key. The transaction is unchanged - the same `IssuerEncryptionKey`/`AuditorEncryptionKey` fields rotate a key once the amendment is active, and the current key is refused with `tecDUPLICATE`. `IssuerKeyMirrorEpoch`, `AuditorKeyMirrorEpoch` and `ContractResult` (rippled #7988) are known to the codec but belong to no format yet
   * `VaultWithdraw` and `LoanBrokerCoverWithdraw` accept `CredentialIDs`, for a `Destination` that requires deposit authorization; validated the way `Payment.CredentialIDs` is
   * the vendored `transactions.macro` is pinned to the same develop commit as `ledger_entries.macro` instead of the 3.3.0 tag, so both conformance tests describe the build the nightly stand runs. Up to 3.3.0 the tag and develop agreed on transaction fields; they no longer do
-  * `Xrpl.BinaryCodec` 11.1.0.0 for the new codec entries. The CI stand (3.3.0) knows none of the new fields, so they are covered by round-trip and validation unit tests rather than integration tests; the nightly stand after #182 has every amendment involved enabled at genesis
+  * `Xrpl.BinaryCodec` 11.4.0.0 for the new codec entries, numbered with `Xrpl` since both move in this release. The CI stand (3.3.0) knows none of the new fields, so they are covered by round-trip and validation unit tests rather than integration tests; the nightly stand after #182 has every amendment involved enabled at genesis
 
 ## 11.3.2.0 06/09/2026
 
