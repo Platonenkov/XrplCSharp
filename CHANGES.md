@@ -1,6 +1,6 @@
 # Changes
 
-## 11.4.0.0 06/09/2026
+## 11.4.0.0 07/09/2026
 
 * **A transition of the connection has one owner** (#179, the follow-up to #178). Every operation that moves the connection - `ChangeServer`, `Connect`, `Disconnect`, `DisconnectAndWaitAsync`, the health check's fast reconnect, the reconnect loop and the path taken when an `OnConnected` handler fails - used to decide for itself what happened to the socket, and two of them running at once were reconciled by `ReferenceEquals(ws, ...)` checks placed after whichever await somebody had noticed. #178 added three such checks and its review found the next window each time. The checks were right where they were; the pattern was what did not scale.
   * the connection now carries a generation. A consumer command and the fast reconnect begin one, taking the session, the socket, the reconnect loop, the ping timer and the message processor out of their fields in a single critical section; the socket callbacks, the loop and the handler-failure path continue the generation of the socket they run for. An operation that finds the generation moved on stands down - after every await and after every consumer callback - and the one that moved it owns the rest. `Disconnect()` wins against anything in flight, and an attempt it overtook closes the socket it opened, whether the takeover found that socket installed or the socket came into being afterwards
