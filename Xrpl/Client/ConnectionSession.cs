@@ -21,6 +21,19 @@ namespace Xrpl.Client
         private static long _sessionIdCounter = 0;
         
         public long SessionId { get; }
+
+        /// <summary>
+        /// The connection transition this session was created under - see
+        /// <c>Connection.TakeOver</c>.
+        /// </summary>
+        /// <remarks>
+        /// A socket callback carries the session, and the session carries the generation, so a
+        /// close or a failure can tell whether the transition that opened this socket is still the
+        /// one in charge of the connection. If it is not, a later operation owns the connection now
+        /// and the callback confines itself to announcing that the session ended.
+        /// </remarks>
+        public long Generation { get; }
+
         public WebSocketClient? Socket { get; private set; }
         public bool IsIntentionalDisconnect { get; set; }
         public bool IsRetiring { get; private set; }
@@ -55,9 +68,10 @@ namespace Xrpl.Client
         /// </summary>
         public Task Completion => _completionTcs.Task;
 
-        public ConnectionSession(WebSocketClient socket)
+        public ConnectionSession(WebSocketClient socket, long generation)
         {
             SessionId = Interlocked.Increment(ref _sessionIdCounter);
+            Generation = generation;
             Socket = socket;
             IsIntentionalDisconnect = false;
             IsRetiring = false;

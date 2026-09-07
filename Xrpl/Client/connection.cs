@@ -208,12 +208,21 @@ public class Connection
 
         /// <summary>
         /// Gets or sets a value indicating whether to enable periodic background health monitoring of the WebSocket connection.<br/>
-        /// When enabled, the connection state is checked every 20 seconds. If the WebSocket is detected as Closed or Aborted,
-        /// or if no data has been received for more than 60 seconds, an automatic reconnection is triggered.<br/>
+        /// When enabled, the local connection state is checked every <see cref="HealthCheckInterval"/>. If the WebSocket is
+        /// detected as no longer Open, an automatic reconnection is triggered.<br/>
         /// This check does not send any network requests — it only inspects the local connection state.<br/>
         /// Automatically enabled when <see cref="UseCustomPing"/> is set to <see langword="true"/>.<br/>
         /// Default: <see langword="false"/>.
         /// </summary>
+        /// <remarks>
+        /// On its own this detects only a socket the runtime already knows is gone. A peer that vanished without
+        /// closing leaves the socket Open, and the only signal for that is silence - which is a signal only when
+        /// something is expected to arrive. That is what <see cref="UseCustomPing"/> adds: keepalive pings whose
+        /// answers keep the activity clock moving, so <see cref="InactivityTimeout"/> can mean "the node stopped
+        /// answering". Without pings an idle connection - no subscriptions, no requests - receives nothing at all,
+        /// and silence would declare a healthy socket dead every <see cref="InactivityTimeout"/>; so the inactivity
+        /// check runs only when <see cref="UseCustomPing"/> is enabled.
+        /// </remarks>
         public bool UseCheckHealth { get; set; } = false;
 
         /// <summary>
@@ -232,13 +241,16 @@ public class Connection
         /// <summary>
         /// Gets or sets how long a connection may go without any inbound activity before the health
         /// check treats it as dead and hands it to the fast-reconnect path.<br/>
+        /// Applies only when <see cref="UseCustomPing"/> is enabled.<br/>
         /// Default: 60 seconds, the threshold this check has always used.
         /// </summary>
         /// <remarks>
         /// A socket whose peer vanished stays <c>Open</c> until the next I/O, so silence is the only
-        /// signal available without sending traffic. Exposed together with
-        /// <see cref="HealthCheckInterval"/> so the fast-reconnect path is reachable from a test in
-        /// under a second instead of over a minute.
+        /// signal that reaches the client - and it is a signal only while keepalive pings are being
+        /// sent, because an idle connection with no subscriptions receives nothing by design. With
+        /// <see cref="UseCustomPing"/> off this value is not consulted; see the remarks on
+        /// <see cref="UseCheckHealth"/>. Exposed together with <see cref="HealthCheckInterval"/> so
+        /// the fast-reconnect path is reachable from a test in under a second instead of over a minute.
         /// </remarks>
         public TimeSpan InactivityTimeout { get; set; } = TimeSpan.FromSeconds(60);
 
@@ -275,28 +287,34 @@ public class Connection
         public int StreamMessageQueueCapacity { get; set; } = 10000;
     }
 
-    private void ValidateConfig()
+    private void ValidateConfig() => ValidateOptions(config);
+
+    /// <summary>
+    /// Rejects an option set the client cannot run with. Static so <see cref="ChangeServer"/> can
+    /// validate the options it was handed before it tears the current connection down.
+    /// </summary>
+    private static void ValidateOptions(ConnectionOptions options)
     {
-        if (config.ConnectionAcquisitionTimeout < config.ConnectionAttemptTimeout)
+        if (options.ConnectionAcquisitionTimeout < options.ConnectionAttemptTimeout)
         {
             throw new ArgumentException(
-                $"ConnectionAcquisitionTimeout ({config.ConnectionAcquisitionTimeout.TotalSeconds}s) must be >= ConnectionAttemptTimeout ({config.ConnectionAttemptTimeout.TotalSeconds}s) to allow at least one full connection attempt.");
+                $"ConnectionAcquisitionTimeout ({options.ConnectionAcquisitionTimeout.TotalSeconds}s) must be >= ConnectionAttemptTimeout ({options.ConnectionAttemptTimeout.TotalSeconds}s) to allow at least one full connection attempt.");
         }
 
         // The WASM timer takes this as an int of milliseconds: zero fires once and never repeats,
         // and anything past int.MaxValue or below zero is rejected outright by the timer itself.
         // Fail here instead, where the message can say which option is wrong.
-        double healthCheckMs = config.HealthCheckInterval.TotalMilliseconds;
+        double healthCheckMs = options.HealthCheckInterval.TotalMilliseconds;
         if (healthCheckMs < 1 || healthCheckMs > int.MaxValue)
         {
             throw new ArgumentException(
-                $"HealthCheckInterval ({config.HealthCheckInterval}) must be between 1ms and {int.MaxValue}ms.");
+                $"HealthCheckInterval ({options.HealthCheckInterval}) must be between 1ms and {int.MaxValue}ms.");
         }
 
-        if (config.InactivityTimeout <= TimeSpan.Zero)
+        if (options.InactivityTimeout <= TimeSpan.Zero)
         {
             throw new ArgumentException(
-                $"InactivityTimeout ({config.InactivityTimeout}) must be positive - a non-positive value would " +
+                $"InactivityTimeout ({options.InactivityTimeout}) must be positive - a non-positive value would " +
                 "treat every connection as dead on the first health check.");
         }
     }
@@ -334,8 +352,9 @@ public class Connection
 
     public string url { get; private set; }
 
-    // Volatile: this is the connectivity gate. It is cleared under _disconnectLock by the
-    // retirement paths and read lock-free by ShouldBeConnected/State/CheckIfNotConnected.
+    // Volatile: this is the connectivity gate. It is written only under _transitionLock - by the
+    // takeover that begins a transition and by ConnectCoreAsync installing that transition's
+    // socket - and read lock-free by ShouldBeConnected/State/CheckIfNotConnected.
     public volatile WebSocketClient ws;
 
     private int? reconnectTimeoutID = null;
@@ -352,41 +371,79 @@ public class Connection
     private static readonly Random _random = new();
 
     /// <summary>
-    /// Guards the reconnect session — <see cref="_reconnectCts"/>, <see cref="_reconnectLoop"/> and
-    /// <see cref="_reconnectAttempts"/> — wherever one is read and another written as a unit:
-    /// <see cref="StopReconnectLoop"/>, <see cref="StartReconnectLoop"/>,
-    /// <see cref="RestartReconnectLoop"/>, <see cref="RetireCurrentSessionAndReconnectAsync"/> and
-    /// the ownership-guarded writes in <see cref="ReconnectLoopAsync"/>.
+    /// The lock every transition of the connection runs its synchronous part under. The
+    /// generation counter (<see cref="_generation"/>), <see cref="ws"/>,
+    /// <see cref="_permanentlyDisconnected"/> and the reconnect-loop state
+    /// (<see cref="_reconnectCts"/>, <see cref="_reconnectLoopGeneration"/>,
+    /// <see cref="_reconnectAttempts"/>) are written only while it is held.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Not every touch of these fields is covered: the per-iteration <c>_reconnectAttempts++</c> in
-    /// <see cref="ReconnectLoopAsync"/>, the plain resets in <c>ChangeServer</c> and
-    /// <c>OnceClose</c>, and the "is a loop already running" pre-checks in
-    /// <c>OnConnectionFailed</c> and <c>OnceClose</c> (which read <c>_reconnectLoop</c>, a
-    /// non-volatile field, outside the lock) all still run outside it. Those predate this lock; do
-    /// not read the list above as "all three fields are always synchronized".
+    /// It absorbs what used to be two locks, <c>_disconnectLock</c> around <see cref="ws"/> and
+    /// <c>_reconnectStateLock</c> around the reconnect session. Kept apart, the two let an
+    /// operation take the socket under one lock and the reconnect state under the other with a gap
+    /// in between - the shape of every race in issue #179. <see cref="_sessionLock"/> stays
+    /// separate because the per-frame session check takes it, and nests inside this one; so does
+    /// <see cref="_messageProcessorLock"/>. The order is fixed: transition, then session, then
+    /// processor.
     /// </para>
     /// <para>
-    /// <c>volatile</c> alone was not enough: it makes each individual access atomic, not the
-    /// sequence of them. The stop path used to read the field three times in a row (Cancel,
-    /// Dispose, null it), so a start running in between could have its brand-new source disposed
-    /// and cleared by the retiring stop — leaving the loop with a dead source and nobody
-    /// reconnecting, which is exactly the permanent wedge this whole area exists to prevent.
-    /// </para>
-    /// <para>
-    /// Nothing that can call back into consumer code runs while the lock is held: cancellation and
-    /// disposal of a retired source happen after the lock is released, and the loop body starts
+    /// Nothing that can call back into consumer code runs while the lock is held, and nothing
+    /// awaits under it: a retired cancellation source is cancelled and disposed after the lock is
+    /// released, the message processor's exit is awaited outside, and the reconnect loop starts
     /// with a yield so that starting it under the lock never runs a notification inline.
     /// </para>
     /// </remarks>
-    private readonly object _reconnectStateLock = new object();
+    private readonly object _transitionLock = new object();
 
-    // Volatile so the ownership checks in ReconnectLoopAsync can read it outside the lock:
-    // a single reference read is atomic, and those checks only ever compare, never mutate.
+    /// <summary>
+    /// The transition that owns the connection right now. Every operation that moves the
+    /// connection either begins a new one (<see cref="TakeOver"/>) or continues the current one,
+    /// and re-validates after every await and every consumer callback with <see cref="Owns"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>ChangeServer</c>, <c>Connect</c>, <c>Disconnect</c>, <c>DisconnectAndWaitAsync</c> and
+    /// the health check's fast reconnect begin a generation: the consumer said something, or the
+    /// connection was found dead, and whatever was in flight before is over. The socket callbacks
+    /// (<c>OnceOpen</c>, <c>OnceClose</c>, <c>OnConnectionFailed</c>), the reconnect loop and the
+    /// failed-<c>OnConnected</c>-handler path continue the generation of the socket they run for:
+    /// a failed attempt hands the same transition to the loop, a successful one completes it. If
+    /// that generation is no longer current, a later operation owns the connection, and the
+    /// callback confines itself to what is unconditionally its own - closing its socket and
+    /// announcing that its session ended.
+    /// </para>
+    /// <para>
+    /// This replaces the ad-hoc <c>ReferenceEquals(ws, ...)</c> checks that used to reconcile two
+    /// operations running at once. Those were placed after whichever await somebody had noticed;
+    /// the generation is checked after all of them, and the socket read and the send happen under
+    /// the same lock the takeover writes under, so there is no gap for a third operation to fit
+    /// into.
+    /// </para>
+    /// </remarks>
+    private long _generation;
+
+    /// <summary>
+    /// What kind of operation began the current generation. Only used to tell a superseded caller
+    /// what superseded it.
+    /// </summary>
+    private TransitionKind _generationKind;
+
+    /// <summary>
+    /// The generation whose reconnect loop is running, or 0 when none is.
+    /// </summary>
+    /// <remarks>
+    /// This is what <c>OnceClose</c> and <c>OnConnectionFailed</c> ask before starting a loop, and
+    /// what the loop clears - under <see cref="_transitionLock"/>, together with a re-check that
+    /// the socket is still open - when its attempt succeeded. It used to be a task reference and an
+    /// <c>IsCompleted</c> check, which left a window between the loop's <c>break</c> and its task
+    /// completing where a close saw a running loop that was about to exit and nobody reconnected.
+    /// </remarks>
+    private long _reconnectLoopGeneration;
+
+    // Volatile so the lock-free readers (WaitForConnectionAsync, CheckIfNotConnected) see a
+    // consistent reference; every write is under _transitionLock.
     private volatile CancellationTokenSource _reconnectCts;
-
-    private Task _reconnectLoop;
 
     private SemaphoreSlim _connectLock = new(initialCount: 1, maxCount: 1);
 
@@ -593,12 +650,243 @@ public class Connection
 
     private TaskCompletionSource<bool>? _disconnectTcs = null;
 
-    private readonly object _disconnectLock = new();
-
     // Per-session isolation for ChangeServer
     private ConnectionSession? _activeSession = null;
 
     private readonly object _sessionLock = new();
+
+    /// <summary>
+    /// What began a generation. Carried for the message a superseded caller gets, nothing else.
+    /// </summary>
+    private enum TransitionKind
+    {
+        None,
+
+        Connect,
+
+        ChangeServer,
+
+        Disconnect,
+
+        FastReconnect,
+    }
+
+    /// <summary>
+    /// What <see cref="TakeOver"/> hands the new owner: its generation, the session and socket it
+    /// took from the previous one, and the exit of the message processor that went with them.
+    /// </summary>
+    private readonly record struct Takeover(
+        long Generation,
+        ConnectionSession? Session,
+        WebSocketClient? Socket,
+        Task ProcessorExit);
+
+    /// <summary>
+    /// Whether <paramref name="generation"/> is still the transition in charge of the connection.
+    /// </summary>
+    private bool Owns(long generation) => Volatile.Read(ref _generation) == generation;
+
+    private long CurrentGeneration() => Volatile.Read(ref _generation);
+
+    /// <summary>
+    /// Begins a new transition: bumps the generation, takes the live session and socket out of
+    /// their fields, stops the reconnect loop, the ping timer and the message processor - all in
+    /// one critical section, so that no other operation can see the connection half taken.
+    /// </summary>
+    /// <remarks>
+    /// The socket leaves <see cref="ws"/> here, before the caller sweeps the pending requests:
+    /// the sweep resumes consumer continuations inline, and a request issued from one of them
+    /// must already see no usable connection (issue #177). Closing the socket that came out is
+    /// the caller's job - how it is closed depends on why it was taken.
+    /// </remarks>
+    /// <param name="kind">What is taking over.</param>
+    /// <param name="retireSession">
+    /// Whether to mark the session retiring, which silences its socket's close callback.
+    /// <c>Disconnect</c> passes <see langword="false"/>: <c>OnceClose</c> is what announces a user
+    /// disconnect.
+    /// </param>
+    private Takeover TakeOver(TransitionKind kind, bool retireSession)
+    {
+        CancellationTokenSource? retiredCts;
+        Takeover takeover;
+        lock (_transitionLock)
+        {
+            takeover = TakeOverLocked(kind, retireSession, out retiredCts);
+        }
+
+        retiredCts?.Cancel();
+        retiredCts?.Dispose();
+        return takeover;
+    }
+
+    /// <summary>
+    /// <see cref="TakeOver"/> for the health check's fast reconnect, which may only take the
+    /// connection over if the socket it found dead is still the one installed. A user
+    /// <c>Disconnect()</c> that landed while the ping check was running has taken the socket
+    /// already, and a reconnect after that would resurrect a client the consumer took down.
+    /// </summary>
+    /// <param name="expectedSocket">The socket the ping check found dead.</param>
+    /// <param name="takeover">The takeover, when it happened.</param>
+    /// <param name="ownCts">
+    /// The cancellation source installed as <see cref="_reconnectCts"/> for this reconnect, so a
+    /// later takeover can cancel the attempt in flight.
+    /// </param>
+    private bool TryTakeOverFrom(
+        WebSocketClient expectedSocket,
+        out Takeover takeover,
+        out CancellationTokenSource ownCts)
+    {
+        CancellationTokenSource? retiredCts;
+        lock (_transitionLock)
+        {
+            if (!ReferenceEquals(ws, expectedSocket))
+            {
+                takeover = default;
+                ownCts = null;
+                return false;
+            }
+
+            takeover = TakeOverLocked(TransitionKind.FastReconnect, retireSession: true, out retiredCts);
+            ownCts = new CancellationTokenSource();
+            _reconnectCts = ownCts;
+            _reconnectAttempts = 1;
+            _reconnectMode = ReconnectMode.FastReconnect;
+            _isFastReconnectActive = true;
+        }
+
+        retiredCts?.Cancel();
+        retiredCts?.Dispose();
+        return true;
+    }
+
+    /// <summary>
+    /// The body of <see cref="TakeOver"/>. Must be called with <see cref="_transitionLock"/> held;
+    /// the retired reconnect source comes out for the caller to cancel and dispose outside it.
+    /// </summary>
+    private Takeover TakeOverLocked(
+        TransitionKind kind,
+        bool retireSession,
+        out CancellationTokenSource? retiredCts)
+    {
+        long generation = ++_generation;
+        _generationKind = kind;
+        _permanentlyDisconnected = kind == TransitionKind.Disconnect;
+
+        // The global intentional-disconnect flag follows the generation: set by a disconnect,
+        // cleared by anything that connects. It used to be cleared only by OnceOpen and by
+        // ChangeServer, so a Connect() after a Disconnect() ran with it still set, and a failure of
+        // the new handshake was read as a user disconnect - "closed permanently", no reconnect
+        // loop, and the caller waiting out ConnectionAcquisitionTimeout for a TimeoutException
+        // that named nothing. The sockets a disconnect closed stay recognisable through their own
+        // per-socket marks, which this flag does not touch.
+        _isIntentionalDisconnect = kind == TransitionKind.Disconnect;
+        if (kind == TransitionKind.Disconnect)
+        {
+            _reconnectMode = ReconnectMode.None;
+        }
+
+        retiredCts = StopReconnectLoopLocked();
+        DetachLocked(retireSession, out ConnectionSession? session, out WebSocketClient? socket);
+        StopPingTimerSync();
+
+        (Task? processorTask, CancellationTokenSource? processorCts) detached;
+        lock (_messageProcessorLock)
+        {
+            detached = DetachMessageProcessor();
+        }
+
+        return new Takeover(
+            generation,
+            session,
+            socket,
+            AwaitMessageProcessorExitAsync(detached.processorTask, detached.processorCts));
+    }
+
+    /// <summary>
+    /// Takes the session and socket out of their fields. Must be called with
+    /// <see cref="_transitionLock"/> held.
+    /// </summary>
+    /// <remarks>
+    /// Nothing is taken when there is no socket: the session then belongs to whoever took the
+    /// socket before - a <c>Disconnect()</c> whose close callback is about to announce
+    /// <see cref="SessionEndReason.UserDisconnected"/> - or to a close that has already been
+    /// announced. Retiring it here would silence that callback and hand the session to a caller
+    /// that would announce a reason of its own for an end that was somebody else's.
+    /// </remarks>
+    private void DetachLocked(bool retireSession, out ConnectionSession? session, out WebSocketClient? socket)
+    {
+        socket = ws;
+        ws = null;
+
+        if (socket == null)
+        {
+            session = null;
+            return;
+        }
+
+        lock (_sessionLock)
+        {
+            session = _activeSession;
+            if (retireSession)
+            {
+                session?.MarkAsRetiring();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="socket"/> will run its close callback once closed - which is only
+    /// true of a socket whose receive loop exists. A handshake that is cancelled reports nothing,
+    /// and a socket that is already closed has reported already.
+    /// </summary>
+    private static bool WillReportClose(WebSocketClient socket) =>
+        socket.State is WebSocketState.Open or WebSocketState.CloseSent or WebSocketState.CloseReceived;
+
+    /// <summary>
+    /// Retires the reconnect loop's state. Must be called with <see cref="_transitionLock"/>
+    /// held; the source comes out for the caller to cancel and dispose outside it. A loop that
+    /// is running notices on its next ownership check and stands down.
+    /// </summary>
+    private CancellationTokenSource? StopReconnectLoopLocked()
+    {
+        CancellationTokenSource? retired = _reconnectCts;
+        _reconnectCts = null;
+        _reconnectAttempts = 0;
+        _reconnectLoopGeneration = 0;
+        _isFastReconnectActive = false;
+        return retired;
+    }
+
+    private void ThrowIfSuperseded(long generation)
+    {
+        lock (_transitionLock)
+        {
+            ThrowIfSupersededLocked(generation);
+        }
+    }
+
+    private void ThrowIfSupersededLocked(long generation)
+    {
+        if (_generation != generation)
+        {
+            throw SupersededLocked();
+        }
+    }
+
+    /// <summary>
+    /// The exception a superseded caller gets. A <c>Disconnect()</c> that won leaves the client
+    /// disconnected, and <see cref="NotConnectedException"/> is what every other path says about
+    /// that; anything else that won is connecting, or connected, somewhere the caller did not ask
+    /// for, and a cancellation says so without claiming the client is down.
+    /// </summary>
+    private Exception SupersededLocked() =>
+        _generationKind switch
+        {
+            TransitionKind.Disconnect => new NotConnectedException("Client has been disconnected. Call Connect() to reconnect."),
+            TransitionKind.ChangeServer => new OperationCanceledException($"Superseded by a later ChangeServer to {url}."),
+            TransitionKind.Connect => new OperationCanceledException("Superseded by a later Connect()."),
+            _ => new OperationCanceledException("Superseded by a reconnect the health check started."),
+        };
 
     public XrpConnectionState CurrentConnectionState => _currentConnectionState;
 
@@ -747,77 +1035,89 @@ public class Connection
         ValidateConfig();
     }
 
+    /// <summary>
+    /// Moves the client to another server: retires the current session and connects to
+    /// <paramref name="server"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is a transition of the connection and it can be superseded by a later one - a
+    /// <c>Disconnect()</c>, another <c>ChangeServer</c>, a <c>Connect()</c> - issued while it is
+    /// still under way, from another thread or from a consumer callback it runs. It then stops
+    /// where it is, leaves the rest to the operation that took over, and tells the caller:
+    /// <see cref="NotConnectedException"/> when a <c>Disconnect()</c> won, because the client is
+    /// down; <see cref="OperationCanceledException"/> when anything else won, because the client
+    /// is connecting, or connected, somewhere this call did not ask for. It used to reset the
+    /// disconnect and connect anyway - the client online after the consumer took it down.
+    /// </para>
+    /// <para>
+    /// The old session is retired in the background whatever happens, and the switch is
+    /// announced through <see cref="OnSessionEnded"/> before the new connection is opened.
+    /// </para>
+    /// </remarks>
     public async Task ChangeServer(
         string server,
         ConnectionOptions? options = null,
         CancellationToken cancellationToken = default)
     {
-        SetConnectionState(XrpConnectionState.Connecting, message: $"ChangeServer: Switching to {server}...");
+        // Validated before anything is torn down: a bad option set used to be reported only
+        // after the old connection was gone.
+        ValidateOptions(options ?? config);
 
-        // =====================================================
-        // FAST CHANGE SERVER with PER-SESSION ISOLATION
-        // =====================================================
-        // Old session is marked as retiring and cleaned up in background.
-        // New session is created immediately without waiting.
-        // Callbacks check session ID to ignore retiring sessions.
+        Takeover takeover = TakeOver(TransitionKind.ChangeServer, retireSession: true);
+        long generation = takeover.Generation;
 
-        // 1. Quick state cleanup - stop reconnect loop
-        StopReconnectLoop();
-        
-        // 2. Cancel ping timer and the message processor (but don't wait yet). Stopping the
-        // processor is explicit since StopPingTimerSync no longer does it as a side effect - this
-        // session's queue goes with the session.
-        StopPingTimerSync();
-
-        // 3. Mark old session as retiring (callbacks will be ignored) and clear ws - BEFORE
-        // rejecting the pending requests, on purpose.
-        // The rejection sweep resumes consumer continuations - inline on this thread when there
-        // is no synchronization context - and a consumer that issues its next request from there
-        // must already see no usable connection. Cleared afterwards, that request passes the
-        // connectivity check on the old socket and is written into it after the sweep that would
-        // have rejected it; nothing completes it before RequestTimeout (issue #177).
-        ConnectionSession? oldSession;
-        lock (_sessionLock)
+        // The old socket is closed in the background whatever happens below. A call superseded at
+        // one of the checks still owes the server it left a close frame - nobody else holds the
+        // socket any more.
+        //
+        // Per-socket tracking only. The global _isIntentionalDisconnect flag was only reset in
+        // OnceOpen, so if the NEW server never came up it stayed set forever: OnConnectionFailed
+        // then read the failure of the new socket as a user disconnect and started no reconnect
+        // loop, leaving the client dead with "No connection attempt in progress."
+        if (takeover.Socket != null)
         {
-            oldSession = _activeSession;
-            oldSession?.MarkAsRetiring();
+            Interlocked.Exchange(ref _userInitiatedSocket, takeover.Socket);
+            MarkSocketAsUserInitiated(takeover.Socket);
+            _ = RetireOldSessionAsync(takeover.Session, takeover.Socket);
+        }
+        else
+        {
+            takeover.Session?.CompleteSession();
         }
 
-        WebSocketClient? oldSocket;
-        lock (_disconnectLock)
+        string sessionEnded = $"Switched to {server}. Subscriptions from the previous connection are no longer in effect.";
+
+        try
         {
-            oldSocket = ws;
-            ws = null;
+            // Notified after the takeover, not before it: a handler that answers this with
+            // Disconnect() has to win, and it can only win against a transition that has begun.
+            SetConnectionState(XrpConnectionState.Connecting, message: $"ChangeServer: Switching to {server}...");
+            ThrowIfSuperseded(generation);
+
+            // The takeover cleared ws before this sweep, on purpose: the sweep resumes consumer
+            // continuations - inline on this thread when there is no synchronization context - and
+            // a request issued from one of them must already see no usable connection (issue #177).
+            requestManager.RejectAllWithCancellation();
+            connectionManager.RejectAllAwaitingWithCancellation();
+            ThrowIfSuperseded(generation);
+
+            // The message processor went with the session, and its reader is let go of after the
+            // sweep, not before: consumers are released first, and this is the first yield of the
+            // switch - what a single-threaded host runs their continuations on.
+            await takeover.ProcessorExit;
+            ThrowIfSuperseded(generation);
+
+            await WaitForPingToFinishAsync();
+            ThrowIfSuperseded(generation);
         }
-
-        // 4. Reject all pending requests BEFORE waiting for ping
-        // This allows the ping handler to receive OperationCanceledException and exit quickly
-        requestManager.RejectAllWithCancellation();
-        connectionManager.RejectAllAwaitingWithCancellation();
-
-        // 5. The message processor goes with the session, and its reader is let go of after the
-        // sweep, not before: consumers are released first, and this is the first yield of the
-        // switch - what a single-threaded host runs their continuations on.
-        await StopMessageProcessorAsync();
-
-        // 6. Now wait for ping to finish (should be very fast since requests were rejected)
-        await WaitForPingToFinishAsync();
-
-        // 7. Mark old socket for intentional disconnect (per-socket tracking only)
-        // CRITICAL: Do NOT set global _isIntentionalDisconnect = true here - same rule as the ping/network
-        // recovery path. The global flag was only reset in OnceOpen, so if the NEW server never came up it
-        // stayed set forever: OnConnectionFailed then read the failure of the new socket as a user disconnect,
-        // reported "Connection closed permanently." and started no reconnect loop, leaving the client dead
-        // with the misleading "No connection attempt in progress. Call Connect() first."
-        // Per-socket tracking (_userInitiatedSockets + the socket's own flag, set in RetireOldSessionAsync)
-        // already filters late callbacks from the old socket, and keeps global state clean for the new one.
-        if (oldSocket != null)
+        catch
         {
-            Interlocked.Exchange(ref _userInitiatedSocket, oldSocket);
-            MarkSocketAsUserInitiated(oldSocket);
-
-            // 6. Fire-and-forget GRACEFUL disposal - no blocking
-            _ = RetireOldSessionAsync(oldSession, oldSocket);
+            // Superseded before the switch was announced. The session was retired by the takeover,
+            // which silences its own close callback, and the operation that took over does not
+            // know it - so the announcement the consumer is owed goes out here, or never.
+            await NotifySessionEndedAsync(takeover.Session, SessionEndReason.ServerChanged, sessionEnded);
+            throw;
         }
 
         // The consumer's subscriptions belonged to the session just retired and do not follow the
@@ -826,32 +1126,33 @@ public class Connection
         // Connecting, which is what a first connection reports too. Announced before the new
         // connection is opened, so a consumer cannot see OnConnected for the new session and only
         // afterwards learn that the old one is gone.
-        await NotifySessionEndedAsync(
-            oldSession,
-            SessionEndReason.ServerChanged,
-            $"Switched to {server}. Subscriptions from the previous connection are no longer in effect.");
+        await NotifySessionEndedAsync(takeover.Session, SessionEndReason.ServerChanged, sessionEnded);
 
-        // 7. Update config for new server
-        url = server;
-        if (options != null)
+        // The handler above may have started something of its own; the target is written only by
+        // the transition that still owns the connection.
+        lock (_transitionLock)
         {
-            config = options;
+            ThrowIfSupersededLocked(generation);
+            url = server;
+            if (options != null)
+            {
+                config = options;
+            }
         }
 
-        ValidateConfig();
-        _reconnectAttempts = 0;
         Interlocked.Exchange(ref _connectHandlerFailures, value: 0);
 
-        // 8. Reset permanentlyDisconnected for new connection
-        _permanentlyDisconnected = false;
+        await ConnectCoreAsync(generation, cancellationToken);
+        await WaitForConnectionAsync(config.ConnectionAcquisitionTimeout, cancellationToken);
 
-        // Clear the global intentional-disconnect flag explicitly: it may still be set from an earlier
-        // user Disconnect() (it is only ever reset in OnceOpen), and leaving it set would make a failure
-        // of the NEW connection look intentional and suppress reconnection.
-        _isIntentionalDisconnect = false;
-
-        // 9. Immediately connect to new server (new session created in Connect)
-        await Connect(cancellationToken);
+        // Connected - but a later ChangeServer that took over during the wait connected to its own
+        // server, and this call's is not where the client is.
+        string connectedTo = GetUrl();
+        if (!string.Equals(connectedTo, server, StringComparison.Ordinal))
+        {
+            throw new OperationCanceledException(
+                $"ChangeServer to {server} was superseded by a later ChangeServer to {connectedTo}.");
+        }
     }
 
     /// <summary>
@@ -875,219 +1176,155 @@ public class Connection
     }
 
     /// <summary>
-    /// Retires current session and reconnects immediately (same flow as ChangeServer).
+    /// Retires the current session and reconnects immediately (same flow as ChangeServer).
     /// Used for ping timeout and network drop to avoid slow reconnect with exponential backoff.
     /// </summary>
-    private async Task RetireCurrentSessionAndReconnectAsync(string reason)
+    /// <remarks>
+    /// <para>
+    /// Runs inside the ping check that found <paramref name="deadSocket"/> dead. It takes the
+    /// connection over only if that socket is still the one installed: a user
+    /// <c>Disconnect()</c> that landed during the check has taken it already, and reconnecting
+    /// after that would resurrect a client the consumer took down. It used to check
+    /// <c>_permanentlyDisconnected</c> at two points along the way instead, and the review of
+    /// #178 found the point in between.
+    /// </para>
+    /// <para>
+    /// The session and socket are captured by the takeover, before the
+    /// <see cref="XrpConnectionState.RestoringConnection"/> notification - not after it. A
+    /// handler that answers that notification with a <c>ChangeServer</c> and blocks on it has
+    /// installed a replacement session by the time the callback returns; captured then, the
+    /// replacement would be the one marked retiring. Now the handler's switch takes the
+    /// connection over, and this path stands down at the check that follows the callback.
+    /// </para>
+    /// </remarks>
+    private async Task RetireCurrentSessionAndReconnectAsync(string reason, WebSocketClient deadSocket)
     {
-        // =====================================================
-        // CRITICAL: Set reconnect state FIRST so IsReconnectActive() returns true
-        // throughout the entire operation, including if Connect() fails.
-        // =====================================================
-        
-        // 1. Set reconnect mode FIRST - this is the authoritative state
-        // It will be cleared only when connection is stable (in OnceOpen)
-        _reconnectMode = ReconnectMode.FastReconnect;
-        _isFastReconnectActive = true; // Keep for backward compatibility
-        
-        // 2-3. Retire the previous reconnect session and install this one as a single transaction,
-        // so a concurrent stop/start cannot dispose the source created here. Cancellation and
-        // disposal of the old source happen after the lock is released.
-        CancellationTokenSource oldCts;
-        CancellationTokenSource ownCts;
-        lock (_reconnectStateLock)
+        if (!TryTakeOverFrom(deadSocket, out Takeover takeover, out CancellationTokenSource ownCts))
         {
-            oldCts = _reconnectCts;
-            _reconnectLoop = null; // Clear old loop reference so StartReconnectLoop can start a new one
-            _reconnectAttempts = 1;
-            ownCts = new CancellationTokenSource();
-            _reconnectCts = ownCts;
+            Debug.WriteLine($"{DateTime.Now}Fast reconnect not started - the socket found dead is no longer the connection");
+            return;
         }
 
-        oldCts?.Cancel();
-        oldCts?.Dispose();
-        
-        // 4. Now send first notification - IsReconnectActive() will return true
+        long generation = takeover.Generation;
+
+        // Per-socket tracking only - see ChangeServer for why the global flag stays clear. Closed
+        // in the background before anything else, so a stand-down below leaves nothing open.
+        if (takeover.Socket != null)
+        {
+            Interlocked.Exchange(ref _userInitiatedSocket, takeover.Socket);
+            MarkSocketAsUserInitiated(takeover.Socket);
+            takeover.Socket.SetIntentionalDisconnect(); // Suppresses Critical logging in receive loop
+            _ = RetireOldSessionAsync(takeover.Session, takeover.Socket);
+        }
+        else
+        {
+            takeover.Session?.CompleteSession();
+        }
+
         // Consumer handler exceptions are contained inside SetConnectionState - an escaping throw
-        // here would leave the source installed above with no loop and nobody to dispose it.
+        // here would leave the source installed by the takeover with no loop and nobody to
+        // dispose it.
         SetConnectionState(
             XrpConnectionState.RestoringConnection,
             message: $"{reason} Reconnecting immediately...",
             ConnectionCloseSeverity.Warning,
             reconnect: BuildReconnectInfo());
 
-        // =====================================================
-        // FAST RECONNECT with PER-SESSION ISOLATION (same as ChangeServer)
-        // =====================================================
-        // Old session is marked as retiring and cleaned up in background.
-        // New session is created immediately without waiting.
-        // Callbacks check session ID to ignore retiring sessions.
-
-        // 4. Stop ping timer and the message processor (but don't wait yet) - the queue belongs
-        // to the session being retired.
-        StopPingTimerSync();
-
-        // 5. Mark old session as retiring (callbacks will be ignored) and clear ws - BEFORE
-        // rejecting the pending requests, on purpose.
-        // The rejection sweep resumes consumer continuations - inline on this thread when there
-        // is no synchronization context - and a consumer that issues its next request from there
-        // must already see no usable connection. Cleared afterwards, that request passes the
-        // connectivity check on the old socket and is written into it after the sweep that would
-        // have rejected it; nothing completes it before RequestTimeout (issue #177).
-        ConnectionSession? oldSession;
-        lock (_sessionLock)
+        // Standing down before the session end is announced still owes that announcement: the
+        // takeover retired the session, which silences its own close callback, and whoever took
+        // over does not know the session - see the same catch in ChangeServer.
+        if (!Owns(generation))
         {
-            oldSession = _activeSession;
-            oldSession?.MarkAsRetiring();
+            Debug.WriteLine($"{DateTime.Now}Fast reconnect superseded from the status handler");
+            await NotifySessionEndedAsync(takeover.Session, SessionEndReason.ConnectionLost, reason).ConfigureAwait(false);
+            return;
         }
 
-        WebSocketClient? oldSocket;
-        lock (_disconnectLock)
-        {
-            oldSocket = ws;
-            ws = null;
-        }
-
-        // 6. Reject all pending requests BEFORE waiting for ping
-        // This allows the ping handler to receive OperationCanceledException and exit quickly
+        // ws is already null, so a request issued from a rejected continuation sees no usable
+        // connection (issue #177). The rejection also lets the ping handler exit quickly.
         requestManager.RejectAllWithCancellation();
         connectionManager.RejectAllAwaitingWithCancellation();
 
-        // 7. The message processor goes with the session (see ChangeServer for the ordering).
-        await StopMessageProcessorAsync().ConfigureAwait(false);
-
-        // 8. Now wait for the ping to finish. This method runs inside the ping check itself, so
-        // the wait returns at once - see WaitForPingToFinishAsync.
-        await WaitForPingToFinishAsync().ConfigureAwait(false);
-
-        // 9. Mark old socket for intentional disconnect (per-socket tracking only)
-        // CRITICAL: Do NOT set global _isIntentionalDisconnect = true for ping/network recoveries!
-        // The global flag would block OnConnectionFailed from processing new connection failures.
-        // Instead, rely solely on per-socket tracking (_userInitiatedSockets HashSet) to filter
-        // late callbacks from the old socket while keeping global state clean for the new connection.
-        if (oldSocket != null)
+        if (!Owns(generation))
         {
-            // Per-socket tracking - filters late callbacks from this specific socket
-            Interlocked.Exchange(ref _userInitiatedSocket, oldSocket);
-            MarkSocketAsUserInitiated(oldSocket);
-            oldSocket.SetIntentionalDisconnect(); // Suppresses Critical logging in receive loop
-
-            // 9. Fire-and-forget GRACEFUL disposal - no blocking
-            _ = RetireOldSessionAsync(oldSession, oldSocket);
+            await NotifySessionEndedAsync(takeover.Session, SessionEndReason.ConnectionLost, reason).ConfigureAwait(false);
+            return;
         }
+
+        // The message processor went with the session (see ChangeServer for the ordering).
+        await takeover.ProcessorExit.ConfigureAwait(false);
+
+        // This method runs inside the ping check itself, so the wait returns at once - see
+        // WaitForPingToFinishAsync.
+        await WaitForPingToFinishAsync().ConfigureAwait(false);
 
         // Same as ChangeServer: the session being retired took the subscriptions with it, and the
         // socket's own close callback will be filtered out as retiring. The RestoringConnection
         // status above reports that the connection is being rebuilt, not that everything bound to
-        // the old one is gone - a consumer had to infer the second from the first.
-        await NotifySessionEndedAsync(oldSession, SessionEndReason.ConnectionLost, reason)
+        // the old one is gone - a consumer had to infer the second from the first. Announced
+        // whether or not this path still owns the connection, for the reason given above.
+        await NotifySessionEndedAsync(takeover.Session, SessionEndReason.ConnectionLost, reason)
             .ConfigureAwait(false);
 
-        // 10. Clear ping/network drop socket tracking (old socket is retired)
-        // CRITICAL: If not cleared, these stale references would cause OnConnectionFailed
-        // to filter callbacks from the NEW socket if Connect() fails, blocking reconnection.
-        _pingTimeoutSocket = null;
-        _networkDropSocket = null;
-
-        // 11. Reset permanentlyDisconnected for new connection - unless the user asked to disconnect
-        // while the awaits above were running. Disconnect() sets the flag, clears the reconnect
-        // state and then waits on the ping task this method runs inside, so it is still blocked
-        // here and cannot have finished its teardown. Clearing its flag and reconnecting anyway
-        // would resurrect a client the consumer explicitly took down - and Disconnect() would
-        // return reporting success while a fresh session was being built behind it.
-        if (_permanentlyDisconnected)
+        if (!Owns(generation))
         {
-            CancellationTokenSource abandoned = null;
-            lock (_reconnectStateLock)
-            {
-                if (ReferenceEquals(_reconnectCts, ownCts))
-                {
-                    abandoned = ownCts;
-                    _reconnectCts = null;
-                    _reconnectAttempts = 0;
-                    _reconnectLoop = null;
-                }
-            }
-
-            abandoned?.Cancel();
-            abandoned?.Dispose();
-            _isFastReconnectActive = false;
-
-            Debug.WriteLine($"{DateTime.Now}Fast reconnect abandoned before connecting - the client was disconnected by the user");
             return;
         }
 
-        _permanentlyDisconnected = false;
+        // Clear ping/network drop socket tracking (old socket is retired). If not cleared, these
+        // stale references would cause OnConnectionFailed to filter callbacks from the NEW socket
+        // if the attempt fails, blocking reconnection.
+        _pingTimeoutSocket = null;
+        _networkDropSocket = null;
 
-        // Note: _reconnectAttempts and _reconnectCts already set at the start of this method
-        // Global _isIntentionalDisconnect stays false - allows new connection failures to be processed
-
-        // 12. Immediately connect (bypass Connect() which calls StopReconnectLoop)
-        // Note: Don't emit Connecting state here - we already emitted RestoringConnection
-        // and Connecting would overwrite ReconnectInfo, confusing consuming apps
+        // Don't emit Connecting state here - RestoringConnection has been emitted already, and
+        // Connecting would overwrite ReconnectInfo, confusing consuming apps.
         try
         {
-            // Pass the token of the session this method owns: a user Disconnect() cancels it, so the
-            // attempt below stops instead of opening a socket behind a client that was taken down.
-            // Disconnect() waits only briefly for the ping task, while acquisition can run much
-            // longer, so the flag check above cannot cover this window on its own.
-            await ConnectInternalAsync(ownCts.Token).ConfigureAwait(false);
+            // The token of the source the takeover installed: a later takeover - a user
+            // Disconnect(), say - cancels it, so the attempt below stops instead of opening a
+            // socket behind a client that was taken down.
+            await ConnectCoreAsync(generation, ownCts.Token).ConfigureAwait(false);
             await WaitForConnectionAsync(config.ConnectionAcquisitionTimeout, ownCts.Token).ConfigureAwait(false);
-            
-            // Connect succeeded - cleanup reconnect state
-            // Note: _reconnectMode will be cleared in OnceOpen when connection is fully established
+
             _isFastReconnectActive = false;
 
-            // Only tear down the source this method installed. The awaits above give a concurrent
-            // path (RestartReconnectLoop from a failing OnConnected handler, say) room to install a
-            // newer one; cancelling and disposing that would strand the sequence it belongs to,
-            // which is the same wedge the ownership checks in ReconnectLoopAsync guard against.
-            // When ownership is lost, ownCts needs no cleanup here: whoever evicted it from the
-            // field cancelled and disposed it as part of doing so.
+            // Only tear down the source this path installed, and only while it still owns the
+            // connection and no loop is running on the source: the attempt above may have failed
+            // at the socket, the failure callback started the loop on this same source, and the
+            // loop is the one that connected - it releases the source itself.
             CancellationTokenSource settled = null;
-            lock (_reconnectStateLock)
+            lock (_transitionLock)
             {
-                if (ReferenceEquals(_reconnectCts, ownCts))
+                if (Owns(generation) &&
+                    _reconnectLoopGeneration != generation &&
+                    ReferenceEquals(_reconnectCts, ownCts))
                 {
                     settled = ownCts;
                     _reconnectCts = null;
                     _reconnectAttempts = 0;
-
-                    // Drop the task reference in the same transaction, for the same reason
-                    // StopReconnectLoop does: a loop may have been started on this very source
-                    // while the awaits above were running (OnConnectionFailed sees no live loop -
-                    // the entry above cleared the reference - and StartReconnectLoop reuses a
-                    // still-valid source). Cancelling that source without clearing the reference
-                    // leaves every loopIsRunning check looking at a task that is exiting, so
-                    // nobody starts a replacement and nobody reconnects.
-                    _reconnectLoop = null;
                 }
             }
 
-            settled?.Cancel();
             settled?.Dispose();
         }
         catch (Exception ex)
         {
-            // If Connect fails, transition to loop reconnect mode
-            // Keep _reconnectMode set (will be LoopReconnect after StartReconnectLoop)
-            
-            // A user Disconnect() can land while the awaits above are running - and it will wait on
-            // the very ping task this method runs inside, so it cannot have finished yet. Handing
-            // the client back to a reconnect loop then would undo an explicit disconnect. The flag
-            // is the authority: leave the state alone and let Disconnect() finish its teardown.
-            if (_permanentlyDisconnected)
+            // A later transition owns the connection - a user Disconnect(), a ChangeServer from a
+            // handler. Handing the client to a reconnect loop now would undo what it did.
+            if (!Owns(generation))
             {
-                Debug.WriteLine($"{DateTime.Now}Fast reconnect abandoned - the client was disconnected by the user: {ex.Message}");
+                Debug.WriteLine($"{DateTime.Now}Fast reconnect superseded: {ex.Message}");
                 return;
             }
 
-            // The wait above ends in cancellation when its own source is retired, and on success the
-            // path that retires it is OnceOpen: the attempt above failed at the socket, the failure
-            // callback started the reconnect loop on this same source, and that loop connected
-            // first. A client that is connected has nothing to reconnect. Treating this as a failure
-            // started a second loop, whose first attempt retired the live socket and opened another -
-            // one reconnect became two, with a RestoringConnection reported on a healthy client.
+            // The wait above ends in cancellation when its source is released, and on success the
+            // path that releases it is the reconnect loop: the attempt above failed at the socket,
+            // the failure callback started the loop on this same source, and that loop connected
+            // first. A client that is connected has nothing to reconnect. Treating this as a
+            // failure started a second loop, whose first attempt retired the live socket and
+            // opened another - one reconnect became two, with a RestoringConnection reported on a
+            // healthy client.
             if (IsConnected())
             {
                 _isFastReconnectActive = false;
@@ -1095,17 +1332,21 @@ public class Connection
                 return;
             }
 
+            // The wait says the client gave up: the loop the failure callback started on this
+            // source ran out of attempts, reported Disconnected and released the source. Starting
+            // another loop here would run a second full series behind a state that said the first
+            // was the last, and StopAfterMaxAttempts would mean nothing.
+            if (ex is NotConnectedException)
+            {
+                _isFastReconnectActive = false;
+                Debug.WriteLine($"{DateTime.Now}Fast reconnect gave up with the reconnect loop: {ex.Message}");
+                return;
+            }
+
             // Start the loop BEFORE notifying: SetConnectionState calls into consumer code, and an
             // exception from a handler must not cost us the reconnect loop. Ordering matters more
             // than the message here - without the loop the client never comes back.
-            //
-            // StartReconnectLoop reuses the source installed above when it is still there. It may
-            // not be: the awaits could have let another path replace or clear it, the same way the
-            // success branch above can no longer assume it still owns ownCts. Either outcome is
-            // survivable here - a live foreign loop makes the call return early, a cleared source
-            // makes it start a fresh sequence (losing only the seeded first delay) - so this path
-            // does not need an ownership check of its own.
-            StartReconnectLoop();
+            StartReconnectLoop(generation);
 
             SetConnectionState(
                 XrpConnectionState.RestoringConnection,
@@ -1209,74 +1450,120 @@ public class Connection
             return;
         }
 
-        StopReconnectLoop();
+        // Connect() is the consumer saying "connect now", and that wins over whatever the client
+        // was doing on its own: the reconnect loop stops, and a handshake another transition still
+        // has in flight is closed - the takeover took it out of ws, so it is this call's to close.
+        Takeover takeover = TakeOver(TransitionKind.Connect, retireSession: true);
+        if (takeover.Socket != null)
+        {
+            MarkSocketAsUserInitiated(takeover.Socket);
+            CloseSocketIntentionally(takeover.Socket);
+        }
+
+        takeover.Session?.CompleteSession();
+
+        // Whatever was written to that socket is not going to be answered. Its close callback
+        // would have swept these, but a close that is still being processed when this takeover
+        // lands finds the connection owned by someone else and leaves the sweep to that owner -
+        // and that owner is this call.
+        requestManager.RejectAllWithCancellation();
+
+        // The previous session's reader may still be inside a consumer handler; the new
+        // connection's reader must not run alongside it. Completed at once on a client that had
+        // no processor, bounded on one that did - see AwaitMessageProcessorExitAsync.
+        await takeover.ProcessorExit;
+
         Interlocked.Exchange(ref _connectHandlerFailures, value: 0);
         SetConnectionState(XrpConnectionState.Connecting, message: $"Connecting to {url}...");
-        await ConnectInternalAsync();
+
+        // A session that had opened held the consumer's subscriptions, and retiring it above
+        // silences the close callback that would otherwise have announced their loss - the same
+        // reason ChangeServer announces for itself. A session that never opened announces
+        // nothing.
+        await NotifySessionEndedAsync(
+            takeover.Session,
+            SessionEndReason.ConnectionLost,
+            "Connect() replaced a connection that was no longer open. Subscriptions from the previous connection are no longer in effect.");
+
+        try
+        {
+            await ConnectCoreAsync(takeover.Generation);
+        }
+        catch (OperationCanceledException)
+        {
+            // Superseded by a later ChangeServer or Connect(): that operation is connecting now,
+            // and the wait below reports on its outcome. OperationCanceledException from this
+            // method means the caller's own token and nothing else - see IXrplClient.Connect. A
+            // Disconnect() that won comes out of ConnectCoreAsync as NotConnectedException and
+            // propagates.
+        }
+
         await WaitForConnectionAsync(config.ConnectionAcquisitionTimeout, cancellationToken);
     }
 
-    private async Task ConnectInternalAsync(CancellationToken ct = default)
+    /// <summary>
+    /// Opens the socket for <paramref name="generation"/>. The caller has taken the connection
+    /// over (or continues a transition that did) and <see cref="ws"/> is null.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Ownership is checked under <see cref="_transitionLock"/> at three points: after the connect
+    /// lock is acquired, together with the installation of the socket, and after the handshake.
+    /// The middle one is what makes a socket created during a race impossible: the takeover and
+    /// the installation run under the same lock, so a takeover either finds <see cref="ws"/>
+    /// empty - and this method, seeing the generation move on, never creates the socket - or
+    /// finds the socket installed and takes it. The last one covers a takeover that landed while
+    /// the handshake ran: the socket is this method's to close, and it closes it.
+    /// </para>
+    /// <para>
+    /// A takeover before the socket exists is reported as an exception
+    /// (<see cref="SupersededLocked"/>); one after the handshake is not - the socket is closed and
+    /// the method returns, leaving the caller's wait to report on whatever the new owner does.
+    /// </para>
+    /// </remarks>
+    /// <param name="generation">The transition this attempt belongs to.</param>
+    /// <param name="ct">
+    /// Cancels the attempt: the reconnect loop's and the fast reconnect's source, which a later
+    /// takeover cancels.
+    /// </param>
+    private async Task ConnectCoreAsync(long generation, CancellationToken ct = default)
     {
-        _permanentlyDisconnected = false;
         await _connectLock.WaitAsync(ct);
         try
         {
-            // Check cancellation before proceeding
             ct.ThrowIfCancellationRequested();
-            
-            if (IsConnected())
-            {
-                return;
-            }
 
-            if (State() == WebSocketState.Connecting)
+            WebSocketClient capturedSocket;
+            ConnectionSession capturedSession;
+            lock (_transitionLock)
             {
-                await connectionManager.AwaitConnection();
-                return;
-            }
+                ThrowIfSupersededLocked(generation);
 
-            if (url == null)
-            {
-                throw new ConnectionException("Cannot connect because no server was specified");
-            }
-
-            if (this.ws != null)
-            {
-                throw new XrplException("Websocket connection never cleaned up.");
-            }
-
-            // Check cancellation again before creating WebSocket
-            ct.ThrowIfCancellationRequested();
-            
-            this.ws = CreateWebSocket(url, config);
-            _lastActiveSocket = this.ws;
-            var capturedSocket = this.ws;
-
-            // Check cancellation AFTER creating WebSocket - if cancelled, close the socket and exit
-            if (ct.IsCancellationRequested)
-            {
-                try
+                if (ShouldBeConnected())
                 {
-                    capturedSocket?.SetIntentionalDisconnect();
-                    _ = capturedSocket?.InitiateGracefulCloseAsync();
+                    return;
                 }
-                catch { /* swallow */ }
-                finally
+
+                if (url == null)
                 {
-                    this.ws = null;
+                    throw new ConnectionException("Cannot connect because no server was specified");
                 }
-                ct.ThrowIfCancellationRequested();
-            }
 
-            // Create session for this connection
-            var newSession = new ConnectionSession(this.ws);
-            lock (_sessionLock)
-            {
-                _activeSession = newSession;
-            }
+                if (ws != null)
+                {
+                    throw new XrplException("Websocket connection never cleaned up.");
+                }
 
-            var capturedSession = newSession;
+                capturedSocket = CreateWebSocket(url, config);
+                ws = capturedSocket;
+                _lastActiveSocket = capturedSocket;
+
+                capturedSession = new ConnectionSession(capturedSocket, generation);
+                lock (_sessionLock)
+                {
+                    _activeSession = capturedSession;
+                }
+            }
 
             timer = new Timer(config.ConnectionAttemptTimeout.TotalMilliseconds);
             timer.Elapsed += async (sender, e) =>
@@ -1295,12 +1582,9 @@ public class Connection
                 }
             };
             timer.Start();
-            if (this.ws == null)
-            {
-                throw new XrplException("Connect: created null websocket");
-            }
+            Timer capturedTimer = timer;
 
-            ws.OnConnect(async (connectedSocket) =>
+            capturedSocket.OnConnect(async (connectedSocket) =>
             {
                 try
                 {
@@ -1312,8 +1596,7 @@ public class Connection
                 }
             });
 
-            var capturedTimer = timer;
-            ws.OnConnectionError(async (e, errorSocket) =>
+            capturedSocket.OnConnectionError(async (e, errorSocket) =>
             {
                 try
                 {
@@ -1331,7 +1614,7 @@ public class Connection
                 }
             });
 
-            ws.OnError(async (e, errorSocket) =>
+            capturedSocket.OnError(async (e, errorSocket) =>
             {
                 try
                 {
@@ -1357,7 +1640,7 @@ public class Connection
             // Bound to the binary callback rather than the string one: the frame is already UTF-8
             // and that is what the JSON reader wants, so the UTF-16 copy of every message - twice
             // the byte length, on the large object heap for a big response - is never made.
-            ws.OnBinaryMessage(async (m, ws) =>
+            capturedSocket.OnBinaryMessage(async (m, _) =>
             {
                 try
                 {
@@ -1373,7 +1656,7 @@ public class Connection
                     Debug.WriteLine($"{DateTime.Now}OnBinaryMessage callback error: {ex.Message}");
                 }
             });
-            ws.OnDisconnect(async (closeStatus, closeDescription, closingSocket) =>
+            capturedSocket.OnDisconnect(async (closeStatus, closeDescription, closingSocket) =>
             {
                 try
                 {
@@ -1392,9 +1675,38 @@ public class Connection
                 }
             });
 
-            await this.ws.Connect();
+            await capturedSocket.Connect();
 
-            connectionManager.AwaitConnection();
+            // The handshake is over, one way or another, and the attempt timer has nothing left
+            // to time. On success and on failure the socket's callbacks stopped it already; a
+            // handshake that a takeover cancelled reports nothing at all - WebSocketClient
+            // swallows the cancellation - and the timer would go on firing OnConnectionFailed
+            // for this dead socket at every ConnectionAttemptTimeout, completing whatever
+            // disconnect source a later DisconnectAndWaitAsync had installed.
+            capturedTimer.Stop();
+            capturedTimer.Dispose();
+
+            // A takeover during the handshake took ws - or found it empty, if the handshake had
+            // already failed and its callback cleared it. A socket that is open is nobody's now
+            // but this method's, and it must not be left open behind the new owner. One that is
+            // not open has been dealt with by its callback, or by the takeover that cancelled it;
+            // marking it again here would re-add it to the user-initiated set after that callback
+            // removed it, with no close left to take it out.
+            bool superseded;
+            lock (_transitionLock)
+            {
+                superseded = !Owns(generation);
+                if (superseded && ReferenceEquals(ws, capturedSocket))
+                {
+                    ws = null;
+                }
+            }
+
+            if (superseded && capturedSocket.State == WebSocketState.Open)
+            {
+                MarkSocketAsUserInitiated(capturedSocket);
+                CloseSocketIntentionally(capturedSocket);
+            }
         }
         finally
         {
@@ -1402,52 +1714,104 @@ public class Connection
         }
     }
 
-    public async Task<int> Disconnect()
+    /// <summary>
+    /// Takes the connection over on behalf of a user disconnect and marks the socket that came
+    /// out - the part <see cref="Disconnect"/> and <see cref="DisconnectAndWaitAsync"/> share.
+    /// </summary>
+    /// <remarks>
+    /// A disconnect wins against anything in flight: the takeover bumps the generation, so a
+    /// <c>ChangeServer</c> or a reconnect that was mid-way stands down at its next check and a
+    /// handshake it had running is closed by the attempt that started it. Nothing resets the
+    /// disconnect afterwards except the consumer's own <c>Connect()</c> or <c>ChangeServer</c>.
+    /// </remarks>
+    /// <returns>
+    /// The takeover and the completion source the socket's close callback completes, when there
+    /// was a socket to close.
+    /// </returns>
+    private (Takeover Takeover, TaskCompletionSource<bool>? Tcs) TakeOverForDisconnect()
     {
-        _isIntentionalDisconnect = true;
-        _permanentlyDisconnected = true;
-
-        // Capture the socket and clear ws BEFORE rejecting the pending requests - see ChangeServer
-        // for why: the sweep runs consumer continuations, and a request issued from one of them
-        // must not find the socket being closed still installed as the connection (issue #177).
-        WebSocketClient? socketToClose;
-        lock (_disconnectLock)
+        // The socket is marked and the completion source installed in the same critical section
+        // that takes the socket: its close callback completes the source, and a peer closing the
+        // socket in the instant between would otherwise find no source to complete and leave
+        // DisconnectAndWaitAsync waiting out its timeout.
+        Takeover takeover;
+        TaskCompletionSource<bool>? tcs = null;
+        CancellationTokenSource? retiredCts;
+        lock (_transitionLock)
         {
-            socketToClose = ws;
-            ws = null;
+            takeover = TakeOverLocked(TransitionKind.Disconnect, retireSession: false, out retiredCts);
 
+            WebSocketClient? socketToClose = takeover.Socket;
             if (socketToClose != null)
             {
                 MarkSocketAsUserInitiated(socketToClose);
                 socketToClose.SetIntentionalDisconnect();
 
-                if (_disconnectTcs == null || _disconnectTcs.Task.IsCompleted)
+                // Only for a socket whose close will be reported. A source installed for a
+                // handshake in flight is completed by nobody - the cancelled handshake reports
+                // nothing - and the next DisconnectAndWaitAsync would wait out its timeout on it.
+                if (WillReportClose(socketToClose))
                 {
-                    _disconnectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    if (_disconnectTcs == null || _disconnectTcs.Task.IsCompleted)
+                    {
+                        _disconnectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    }
+
+                    tcs = _disconnectTcs;
                 }
             }
         }
 
-        ClearReconnectState(); // Clear all reconnect state on user disconnect
-        StopPingTimerSync();
+        retiredCts?.Cancel();
+        retiredCts?.Dispose();
 
-        // Reject pending requests so ping handler can exit quickly
+        return (takeover, tcs);
+    }
+
+    public async Task<int> Disconnect()
+    {
+        (Takeover takeover, _) = TakeOverForDisconnect();
+        long generation = takeover.Generation;
+        WebSocketClient? socketToClose = takeover.Socket;
+
+        // ws left the field in the takeover, before this sweep, so a request issued from a
+        // rejected continuation finds no socket to go into (issue #177). The rejection also lets
+        // the ping handler exit quickly.
         requestManager.RejectAllWithCancellation();
         connectionManager.RejectAllAwaitingWithCancellation();
 
-        await StopMessageProcessorAsync();
+        await takeover.ProcessorExit;
         await WaitForPingToFinishAsync();
 
         if (socketToClose == null)
         {
-            SetConnectionState(XrpConnectionState.Disconnected, message: "Already disconnected.");
+            // Reported only while this disconnect still owns the connection: a Connect() or
+            // ChangeServer that took over during the awaits above is reporting its own state now.
+            if (Owns(generation))
+            {
+                SetConnectionState(XrpConnectionState.Disconnected, message: "Already disconnected.");
+            }
+
             return 0;
         }
 
         Interlocked.Exchange(ref _userInitiatedSocket, socketToClose);
         CloseSocketIntentionally(socketToClose);
 
-        SetConnectionState(XrpConnectionState.Disconnected, message: "Disconnected by user request.");
+        if (Owns(generation))
+        {
+            SetConnectionState(XrpConnectionState.Disconnected, message: "Disconnected by user request.");
+        }
+
+        // Announced here as well as from the socket's close callback, which dedups. The callback
+        // alone is not enough: a Connect() issued right after this call installs a new session
+        // before the old socket's close is processed, and the callback then files it as a stale
+        // session and announces nothing - the consumer bounced the client and never heard that
+        // its subscriptions went with the old connection.
+        await NotifySessionEndedAsync(
+            takeover.Session,
+            SessionEndReason.UserDisconnected,
+            "Disconnected by user request. Subscriptions from this connection are no longer in effect.");
 
         return 0;
     }
@@ -1459,49 +1823,25 @@ public class Connection
     /// <param name="cancellationToken">Cancellation token.</param>
     public async Task DisconnectAndWaitAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
     {
-        _isIntentionalDisconnect = true;
-        _permanentlyDisconnected = true;
+        (Takeover takeover, TaskCompletionSource<bool>? tcs) = TakeOverForDisconnect();
+        long generation = takeover.Generation;
+        WebSocketClient? socketToClose = takeover.Socket;
 
-        // Same ordering as Disconnect(): the socket leaves ws before the sweep runs (issue #177).
-        TaskCompletionSource<bool>? tcs = null;
-        WebSocketClient? socketToClose;
-        lock (_disconnectLock)
-        {
-            socketToClose = ws;
-            ws = null;
-
-            if (socketToClose != null)
-            {
-                MarkSocketAsUserInitiated(socketToClose);
-                socketToClose.SetIntentionalDisconnect();
-
-                if (_disconnectTcs == null || _disconnectTcs.Task.IsCompleted)
-                {
-                    _disconnectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                }
-
-                tcs = _disconnectTcs;
-            }
-        }
-
-        ClearReconnectState(); // Clear all reconnect state on user disconnect
-        StopPingTimerSync();
-
-        // Reject pending requests so ping handler can exit quickly
+        // Same ordering as Disconnect(): the socket left ws before the sweep runs (issue #177).
         requestManager.RejectAllWithCancellation();
         connectionManager.RejectAllAwaitingWithCancellation();
 
-        await StopMessageProcessorAsync();
+        await takeover.ProcessorExit;
         await WaitForPingToFinishAsync();
 
-        if (socketToClose == null || tcs == null)
+        if (socketToClose == null)
         {
             // Nothing here to close - but another DisconnectAndWaitAsync may be mid-way, having
             // taken the socket already. This call promised to return once the socket is gone, so
             // it waits on that one's completion source rather than reporting a disconnect that
             // has not finished.
             TaskCompletionSource<bool>? inProgress;
-            lock (_disconnectLock)
+            lock (_transitionLock)
             {
                 inProgress = _disconnectTcs;
             }
@@ -1511,13 +1851,34 @@ public class Connection
                 await Task.WhenAny(inProgress.Task, Task.Delay(timeout, cancellationToken));
             }
 
-            SetConnectionState(XrpConnectionState.Disconnected, message: "Already disconnected.");
+            if (Owns(generation))
+            {
+                SetConnectionState(XrpConnectionState.Disconnected, message: "Already disconnected.");
+            }
+
             return;
         }
 
         Interlocked.Exchange(ref _userInitiatedSocket, socketToClose);
 
-        SetConnectionState(XrpConnectionState.Disconnected, message: "Disconnected by user request.");
+        if (Owns(generation))
+        {
+            SetConnectionState(XrpConnectionState.Disconnected, message: "Disconnected by user request.");
+        }
+
+        // See Disconnect() for why this is announced here and not left to the close callback.
+        await NotifySessionEndedAsync(
+            takeover.Session,
+            SessionEndReason.UserDisconnected,
+            "Disconnected by user request. Subscriptions from this connection are no longer in effect.");
+
+        if (tcs == null)
+        {
+            // A handshake in flight: closing it reports nothing, so there is nothing to wait for
+            // once the cancellation is issued.
+            CloseSocketIntentionally(socketToClose);
+            return;
+        }
 
         // Start disconnect async - it waits for receive loop which calls OnceClose
         // OnceClose will complete tcs, so both should complete around the same time
@@ -1558,7 +1919,7 @@ public class Connection
 
     private void CompleteDisconnectTcs()
     {
-        lock (_disconnectLock)
+        lock (_transitionLock)
         {
             _disconnectTcs?.TrySetResult(true);
             _disconnectTcs = null;
@@ -1744,38 +2105,44 @@ public class Connection
         return false;
     }
 
+    /// <summary>
+    /// The socket reported that its handshake failed, or the connect-attempt timer fired.
+    /// </summary>
+    /// <remarks>
+    /// The failure belongs to the transition that opened the socket. If that transition still
+    /// owns the connection, this is where it continues: the reconnect loop is started under it,
+    /// unless it is already running - each failed attempt of the loop reaches here too. If a later
+    /// transition owns the connection, that operation is handling the connection now; this
+    /// callback closes its socket, clears what was its own, and does not sweep, report or
+    /// reconnect against a connection that is no longer this socket's.
+    /// </remarks>
     private async Task OnConnectionFailed(
         Exception error,
         WebSocketClient? errorSocket = null,
-        long sessionId = 0,
-        bool isPingTimeoutReconnect = false,
-        bool isNetworkDropReconnect = false)
+        long sessionId = 0)
     {
-        // If this is a late callback from the socket closed due to ping timeout, ignore it
-        // (but not the initial call from ping handler which has isPingTimeoutReconnect=true)
-        if (_pingTimeoutSocket != null && _pingTimeoutSocket == errorSocket && !isPingTimeoutReconnect)
+        // A late callback from a socket the ping check or a network drop already retired.
+        if (_pingTimeoutSocket != null && _pingTimeoutSocket == errorSocket)
         {
             return;
         }
 
-        // If this is a late callback from the socket closed due to network drop, ignore it
-        // (but not the initial call which has isNetworkDropReconnect=true)
-        if (_networkDropSocket != null && _networkDropSocket == errorSocket && !isNetworkDropReconnect)
+        if (_networkDropSocket != null && _networkDropSocket == errorSocket)
         {
             return;
         }
 
         // Detect network drop via socket's FailureReason or exception type
-        var isNetworkDrop = isNetworkDropReconnect || 
-                            IsNetworkDropException(error) ||
-                            (errorSocket?.FailureReason == SocketFailureReason.NetworkDrop);
+        bool isNetworkDrop = IsNetworkDropException(error) ||
+                             errorSocket?.FailureReason == SocketFailureReason.NetworkDrop;
 
-        var currentUserInitiatedSocket = Volatile.Read(ref _userInitiatedSocket);
+        WebSocketClient? currentUserInitiatedSocket = Volatile.Read(ref _userInitiatedSocket);
         bool userInitiated;
         bool intentionalDisconnect;
         bool wasOpen;
         bool isCurrentSocket;
-        var isRetiringSession = false;
+        bool isRetiringSession = false;
+        ConnectionSession? failedSession = null;
 
         if (errorSocket != null)
         {
@@ -1789,6 +2156,7 @@ public class Connection
                         if (_activeSession.SessionId == sessionId)
                         {
                             // Same session - check if marked as retiring
+                            failedSession = _activeSession;
                             isRetiringSession = _activeSession.IsRetiring;
                         }
                         else
@@ -1800,8 +2168,8 @@ public class Connection
                 }
                 else
                 {
-                    // Fallback for callbacks without session ID (timer timeout)
-                    var activeSession = _activeSession;
+                    // Fallback for callbacks without session ID
+                    ConnectionSession? activeSession = _activeSession;
                     if (activeSession != null)
                     {
                         if (activeSession.Socket != errorSocket)
@@ -1812,11 +2180,21 @@ public class Connection
                         {
                             isRetiringSession = true;
                         }
+                        else
+                        {
+                            failedSession = activeSession;
+                        }
                     }
                 }
             }
 
-            isCurrentSocket = ws == errorSocket;
+            bool wsIsNull;
+            lock (_transitionLock)
+            {
+                isCurrentSocket = ReferenceEquals(ws, errorSocket);
+                wsIsNull = ws == null;
+            }
+
             userInitiated = currentUserInitiatedSocket == errorSocket || IsSocketUserInitiated(errorSocket);
             intentionalDisconnect = _isIntentionalDisconnect || userInitiated || isRetiringSession;
             wasOpen = errorSocket.State == WebSocketState.Open;
@@ -1828,7 +2206,7 @@ public class Connection
             Interlocked.CompareExchange(ref _userInitiatedSocket, value: null, errorSocket);
 
             // For stale sockets (not current) or retiring sessions, do minimal cleanup
-            if ((!isCurrentSocket && ws != null) || isRetiringSession)
+            if ((!isCurrentSocket && !wsIsNull) || isRetiringSession)
             {
                 // This is a late callback from an old socket - don't touch current connection
                 if (intentionalDisconnect)
@@ -1850,12 +2228,12 @@ public class Connection
             timer?.Dispose();
             timer = null;
 
-            // Use CloseSocketIntentionally for intentional disconnect, ping timeout, or network drop
-            // to suppress Critical error logging in WebSocketClient receive loop
-            if (intentionalDisconnect || isPingTimeoutReconnect || isNetworkDrop)
+            // Use CloseSocketIntentionally for intentional disconnect or network drop to suppress
+            // Critical error logging in WebSocketClient receive loop
+            if (intentionalDisconnect || isNetworkDrop)
             {
                 // Track network drop socket for filtering late callbacks
-                if (isNetworkDrop && !isPingTimeoutReconnect && !intentionalDisconnect)
+                if (isNetworkDrop && !intentionalDisconnect)
                 {
                     _networkDropSocket = errorSocket;
                 }
@@ -1868,14 +2246,18 @@ public class Connection
                 errorSocket.Disconnect();
             }
 
-            if (isCurrentSocket)
+            // Conditional and under the lock: a takeover during the calls above may have
+            // installed a socket of its own, and that one is not this callback's to clear.
+            lock (_transitionLock)
             {
-                ws = null;
+                if (ReferenceEquals(ws, errorSocket))
+                {
+                    ws = null;
+                }
             }
         }
         else
         {
-            isCurrentSocket = true; // null errorSocket means operate on current ws
             intentionalDisconnect = _isIntentionalDisconnect || currentUserInitiatedSocket != null;
             wasOpen = false;
 
@@ -1885,10 +2267,19 @@ public class Connection
             timer = null;
 
             // For null errorSocket with intentional disconnect, still need to clean up ws reference
-            if (intentionalDisconnect && ws != null)
+            if (intentionalDisconnect)
             {
-                CloseSocketIntentionally(ws);
-                ws = null;
+                WebSocketClient? current;
+                lock (_transitionLock)
+                {
+                    current = ws;
+                    ws = null;
+                }
+
+                if (current != null)
+                {
+                    CloseSocketIntentionally(current);
+                }
             }
         }
 
@@ -1901,10 +2292,20 @@ public class Connection
             return;
         }
 
-        // Reject awaiting connection requests and pending requests
-        // For ping timeout and network drop, use cancellation (no Critical logging in consuming apps)
-        // For other failures, use exception with message
-        if (isPingTimeoutReconnect || isNetworkDrop)
+        // From here on everything is about the connection as a whole - the sweep, the state, the
+        // loop - and that belongs to whoever owns it. A callback without a session (no caller in
+        // this class produces one; the parameter defaults exist for a null socket) is taken to be
+        // about the current transition.
+        long generation = failedSession?.Generation ?? CurrentGeneration();
+        if (!Owns(generation))
+        {
+            return;
+        }
+
+        // Reject awaiting connection requests and pending requests. For a network drop, use
+        // cancellation (no Critical logging in consuming apps); for other failures, use an
+        // exception with the message.
+        if (isNetworkDrop)
         {
             requestManager.RejectAllWithCancellation();
             connectionManager.RejectAllAwaitingWithCancellation();
@@ -1914,17 +2315,7 @@ public class Connection
             connectionManager.RejectAllAwaiting(new NotConnectedException(error.Message));
         }
 
-        // For ping timeout or network drop, use Warning severity and RestoringConnection state
-        // For other failures, use Error severity and Disconnected state
-        if (isPingTimeoutReconnect)
-        {
-            SetConnectionState(
-                XrpConnectionState.RestoringConnection,
-                message: "Ping failed. Reconnecting...",
-                ConnectionCloseSeverity.Warning,
-                reconnect: BuildReconnectInfo());
-        }
-        else if (isNetworkDrop)
+        if (isNetworkDrop)
         {
             SetConnectionState(
                 XrpConnectionState.RestoringConnection,
@@ -1932,59 +2323,65 @@ public class Connection
                 ConnectionCloseSeverity.Warning,
                 reconnect: BuildReconnectInfo());
         }
+        else if (failedSession?.IsOpened == true)
+        {
+            // The session had opened, so this is a connection that was lost, not one that never
+            // came up - whatever the socket's State says by now (Aborted, usually). Nothing in
+            // this class reports an established connection's failure this way any more (its
+            // receive loop reports a close), but the wording must not depend on that.
+            SetConnectionState(
+                XrpConnectionState.RestoringConnection,
+                $"Connection lost: {error.Message}. Reconnecting...",
+                ConnectionCloseSeverity.Warning,
+                reconnect: BuildReconnectInfo());
+        }
+        else if (IsReconnectActive())
+        {
+            // During reconnect, use RestoringConnection with ReconnectInfo and Warning severity
+            SetConnectionState(
+                XrpConnectionState.RestoringConnection,
+                $"Connection attempt failed: {error.Message}",
+                ConnectionCloseSeverity.Warning,
+                reconnect: BuildReconnectInfo());
+        }
         else
         {
-            // Check if we're in a reconnect flow using the authoritative _reconnectMode flag
-            // This is set before any reconnect starts and cleared only when connection is stable
-            if (IsReconnectActive())
-            {
-                // During reconnect, use RestoringConnection with ReconnectInfo and Warning severity
-                var reconnectErrorMessage = $"Connection attempt failed: {error.Message}";
-                SetConnectionState(
-                    XrpConnectionState.RestoringConnection,
-                    reconnectErrorMessage,
-                    ConnectionCloseSeverity.Warning,
-                    reconnect: BuildReconnectInfo());
-            }
-            else
-            {
-                // True initial connection failure - no reconnect in progress
-                var errorMessage = $"Initial connection failed: {error.Message}";
-                SetConnectionState(XrpConnectionState.Disconnected, errorMessage, ConnectionCloseSeverity.Error);
-            }
+            // True initial connection failure - no reconnect in progress
+            SetConnectionState(
+                XrpConnectionState.Disconnected,
+                $"Initial connection failed: {error.Message}",
+                ConnectionCloseSeverity.Error);
         }
 
-        // Start reconnect for initial connection failures, ping timeout, or network drop
-        // For ping timeout/network drop, wasOpen=true but we still need to reconnect
-        if (!wasOpen || isPingTimeoutReconnect || isNetworkDrop)
+        // Start reconnect for initial connection failures and network drops. For a network drop
+        // wasOpen is true, and the client still needs to reconnect.
+        if (!wasOpen || isNetworkDrop)
         {
             if (OnDisconnect is not null)
             {
-                // For ping timeout and network drop, use neutral message to avoid Critical logging
-                // in consuming apps that log OnDisconnect messages as errors
-                var disconnectMessage = isPingTimeoutReconnect
-                    ? "Connection lost, reconnecting..."
-                    : isNetworkDrop
-                        ? "Network connection lost, reconnecting..."
-                        : error.Message;
+                // For a network drop, use a neutral message to avoid Critical logging in
+                // consuming apps that log OnDisconnect messages as errors
+                string disconnectMessage = isNetworkDrop
+                    ? "Network connection lost, reconnecting..."
+                    : error.Message;
                 await OnDisconnect?.Invoke(code: null, disconnectMessage)!;
             }
 
-            // Only start reconnect loop if not already running
-            // This prevents _reconnectAttempts from being reset when OnConnectionFailed
-            // is called from within the reconnect loop (each failed attempt triggers this callback)
-            // Check both _reconnectMode AND actual loop task status for accuracy
-            var loopIsRunning = _reconnectLoop != null && !_reconnectLoop.IsCompleted;
-            if (!loopIsRunning)
-            {
-                StartReconnectLoop();
-            }
+            // Under the transition that opened the failed socket, unless a loop is already running
+            // for it - this callback runs for each failed attempt of that loop too, and restarting
+            // it would reset its counter - or a later transition took over during the callback.
+            StartReconnectLoop(generation);
         }
     }
 
     /// <summary>
-    /// Sends a message through the WebSocket connection.
+    /// Sends a message through the WebSocket connection, fire-and-forget.
     /// </summary>
+    /// <remarks>
+    /// Kept for callers outside this class. <see cref="Request"/> and <see cref="GRequest{T, R}"/>
+    /// use <see cref="SendRequestAsync"/> instead, which pairs the socket read with the send under
+    /// the retirement lock and observes the send.
+    /// </remarks>
     /// <param name="ws">The WebSocket client to send through.</param>
     /// <param name="message">The message to send.</param>
     /// <exception cref="DisconnectedException">Thrown when the WebSocket connection is null or closed.</exception>
@@ -1993,6 +2390,100 @@ public class Connection
         if (ws == null)
             throw new DisconnectedException("WebSocket connection was closed before request could be sent");
         ws.SendMessage(message);
+    }
+
+    /// <summary>
+    /// Writes a request into the connection as it stands right now.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The socket is read and the send started under <see cref="_transitionLock"/>, the lock
+    /// every retirement takes the socket out under. Reading the socket first and sending after,
+    /// with nothing in between, still left the few instructions of that "nothing" for a
+    /// retirement to land in: the sweep had rejected the request, and the request went out to a
+    /// server the client had left. Under the lock a retirement finds the request either not yet
+    /// sent - and the cleared socket refuses it - or already handed to the socket.
+    /// </para>
+    /// <para>
+    /// What runs under the lock is the send's synchronous prefix: up to the write being issued
+    /// to <see cref="ClientWebSocket"/>, or up to the wait for the socket's send lock when
+    /// another message holds it - see <see cref="WebSocketClient.SendMessageAsync"/> for the
+    /// residue that case leaves. No consumer code and no await.
+    /// </para>
+    /// </remarks>
+    /// <returns>The send, which faults if the message could not be written.</returns>
+    /// <exception cref="DisconnectedException">There is no open connection to send into.</exception>
+    private Task SendRequestAsync(string message)
+    {
+        byte[] payload = Encoding.UTF8.GetBytes(message);
+
+        lock (_transitionLock)
+        {
+            WebSocketClient? socket = ws;
+            if (socket is not { State: WebSocketState.Open })
+            {
+                throw new DisconnectedException("WebSocket connection was closed before request could be sent");
+            }
+
+            return socket.SendMessageAsync(payload);
+        }
+    }
+
+    /// <summary>
+    /// Starts sending <paramref name="message"/> for the request <paramref name="requestId"/>,
+    /// rejecting the request instead of leaving it pending if the message could not be written.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The connection can be retired between the connectivity check and this send, and the
+    /// socket can refuse the write. Either way the request never left, so it must not stay
+    /// pending until RequestTimeout: the rejection is what the caller's await of the promise
+    /// surfaces. A request the retirement sweep rejected first is left as the sweep left it -
+    /// <see cref="RequestManager.Reject{T}"/> ignores a promise that is already gone.
+    /// </para>
+    /// <para>
+    /// The send is observed, not awaited, by the request. The promise is what honours the
+    /// request's timeout and the caller's token; a send that stalls - a half-open connection
+    /// whose send buffer has filled - would otherwise hold the caller past both, and the health
+    /// check's own ping with it, so the dead socket would never be noticed.
+    /// </para>
+    /// </remarks>
+    private void SendOrReject(Guid requestId, string message)
+    {
+        Task send;
+        try
+        {
+            send = SendRequestAsync(message);
+        }
+        catch (Exception error)
+        {
+            // Nothing left the client - a cleared socket, or the socket refusing to start the
+            // send at all - so the request is rejected with what stopped it rather than thrown
+            // past the promise the caller is about to await.
+            requestManager.Reject(requestId, error);
+            return;
+        }
+
+        if (send.IsCompletedSuccessfully)
+        {
+            return;
+        }
+
+        _ = RejectOnSendFailureAsync(requestId, send);
+    }
+
+    private async Task RejectOnSendFailureAsync(Guid requestId, Task send)
+    {
+        try
+        {
+            await send.ConfigureAwait(false);
+        }
+        catch (Exception error)
+        {
+            requestManager.Reject(
+                requestId,
+                new DisconnectedException($"The request could not be written to the WebSocket: {error.Message}", error));
+        }
     }
 
     private async Task EnsureConnectionForRequest(RequestFailurePolicy? policyOverride = null, CancellationToken cancellationToken = default)
@@ -2009,7 +2500,14 @@ public class Connection
         switch (policy)
         {
             case RequestFailurePolicy.ImmediateFail:
-                throw new NotConnectedException();
+                // Said in words: since #178 this is the exception a request issued during a
+                // server switch gets at once, where it used to get a TimeoutException with
+                // "Timeout" in it, and a consumer classifying failures by message text needs
+                // something to recognise.
+                throw new NotConnectedException(
+                    "The client is not connected to a server and the request was refused at once " +
+                    "(RequestFailurePolicy.ImmediateFail). Call Connect() first, or use " +
+                    "RequestFailurePolicy.WaitForConnection to have requests wait for the connection.");
 
             case RequestFailurePolicy.WaitForConnection:
                 await WaitForConnectionAsync(cancellationToken: cancellationToken);
@@ -2032,9 +2530,12 @@ public class Connection
             throw new NotConnectedException("Client has been disconnected. Call Connect() to reconnect.");
         }
 
-        // Connecting or RestoringConnection states indicate an active attempt even if ws is null
-        var isActiveState = _currentConnectionState == XrpConnectionState.Connecting ||
-                            _currentConnectionState == XrpConnectionState.RestoringConnection;
+        // Connecting or RestoringConnection say an attempt is under way even with ws null. So
+        // does Connected with ws null: a close is being processed - OnceClose takes the socket out
+        // before its first await and reports the state, and starts the loop, after its callbacks -
+        // and every path out of that reports either RestoringConnection or Disconnected. Only
+        // Disconnected means nothing is in progress.
+        var isActiveState = _currentConnectionState != XrpConnectionState.Disconnected;
         var noConnectionAttemptActive = ws == null && _reconnectCts == null && !isActiveState;
         if (noConnectionAttemptActive)
         {
@@ -2059,17 +2560,7 @@ public class Connection
         await EnsureConnectionForRequest(policyOverride, cancellationToken);
 
         var _request = requestManager.CreateRequest(request, timeout: timeout ?? config.RequestTimeout, adminCredentials: GetAdminCredentials(), cancellationToken: cancellationToken);
-        try
-        {
-            WebsocketSendAsync(ws, _request.Message);
-        }
-        catch (Exception error) when (error is EncodingFormatException or DisconnectedException)
-        {
-            // The connection can be retired between the check above and this send. The request
-            // never left, so it must not stay pending until RequestTimeout: the rejection is what
-            // the await below surfaces to the caller.
-            requestManager.Reject(_request.Id, error);
-        }
+        SendOrReject(_request.Id, _request.Message);
 
         object resolved = await _request.Promise;
         return XrplResponse.From<Dictionary<string, object>>(resolved);
@@ -2084,17 +2575,7 @@ public class Connection
         await EnsureConnectionForRequest(policyOverride, cancellationToken);
 
         var _request = requestManager.CreateGRequest<T, R>(request, timeout: timeout ?? config.RequestTimeout, adminCredentials: GetAdminCredentials(), cancellationToken: cancellationToken);
-        try
-        {
-            WebsocketSendAsync(ws, _request.Message);
-        }
-        catch (Exception error) when (error is EncodingFormatException or DisconnectedException)
-        {
-            // The connection can be retired between the check above and this send. The request
-            // never left, so it must not stay pending until RequestTimeout: the rejection is what
-            // the await below surfaces to the caller.
-            requestManager.Reject(_request.Id, error);
-        }
+        SendOrReject(_request.Id, _request.Message);
 
         object resolved = await _request.Promise;
         return XrplResponse.From<T>(resolved);
@@ -2128,28 +2609,33 @@ public class Connection
             return;
         }
 
-        // A user Disconnect() that landed while this socket was still connecting has marked it and
-        // is closing it. Installing it here would undo the disconnect: ws restored, the
-        // intentional-disconnect tracking cleared below, and the close that follows read as a
-        // network drop that starts a reconnect loop. The session check above does not cover this -
-        // Disconnect() does not retire the session, because OnceClose is what announces a user
-        // disconnect - so the socket's own marks are the signal.
-        if (_permanentlyDisconnected || IsSocketUserInitiated(connectedSocket))
+        lock (_transitionLock)
         {
-            return;
-        }
+            // The transition that opened this socket has been superseded: a later operation owns
+            // the connection, and it either took this socket already or - for a socket that
+            // finished its handshake after the takeover - leaves it to ConnectCoreAsync to close.
+            // Installing it here would undo that operation. The socket's own marks cover the
+            // same case for a user Disconnect(), which does not retire the session (OnceClose is
+            // what announces a user disconnect) but does mark the socket it takes.
+            if (openedSession.Generation != _generation ||
+                _permanentlyDisconnected ||
+                IsSocketUserInitiated(connectedSocket))
+            {
+                return;
+            }
 
-        // Verify the connected socket matches current ws, or update ws if it was cleared
-        if (ws == null)
-        {
-            // Restore ws reference from the connected socket
-            ws = connectedSocket;
-        }
-        else if (ws != connectedSocket)
-        {
-            // This is a stale callback from an old socket, ignore it silently
-            // Don't touch the timer - it belongs to the new connection
-            return;
+            // Verify the connected socket matches current ws, or update ws if it was cleared
+            if (ws == null)
+            {
+                // Restore ws reference from the connected socket
+                ws = connectedSocket;
+            }
+            else if (!ReferenceEquals(ws, connectedSocket))
+            {
+                // This is a stale callback from an old socket, ignore it silently
+                // Don't touch the timer - it belongs to the new connection
+                return;
+            }
         }
 
         // Only stop timer for current socket's callback
@@ -2157,8 +2643,11 @@ public class Connection
         timer?.Dispose();
         timer = null;
 
-        // Clear all reconnect state - connection is now stable
-        ClearReconnectState();
+        // The connection is up. The reconnect loop, if this socket is its attempt, releases its
+        // own state once ConnectCoreAsync returns to it - under the lock, with a re-check that
+        // the socket is still open - so nothing here touches it. Only the mode flags are cleared.
+        _reconnectMode = ReconnectMode.None;
+        _isFastReconnectActive = false;
 
         // Reset all intentional disconnect tracking now that new connection succeeded
         // This is the safe place to clear these - old socket callbacks will have already 
@@ -2195,13 +2684,23 @@ public class Connection
                 await OnConnected?.Invoke();
             }
 
+            // The handler is consumer code, and a Disconnect() or ChangeServer from inside it has
+            // taken the connection over by now: ws is theirs (or nobody's), and reporting
+            // Connected on top of the Disconnected they reported - then starting a ping timer that
+            // nothing would ever stop - would be this path speaking for a connection it no longer
+            // owns.
+            if (!Owns(openedSession.Generation))
+            {
+                return;
+            }
+
             Interlocked.Exchange(ref _connectHandlerFailures, value: 0);
             SetConnectionState(XrpConnectionState.Connected, message: $"Connected {url}");
         }
         catch (Exception error)
         {
             connectionManager.RejectAllAwaiting(error);
-            await OnConnectHandlerFailedAsync(connectedSocket, error);
+            await OnConnectHandlerFailedAsync(connectedSocket, openedSession, error);
             return; // Don't start ping timer if connection failed
         }
 
@@ -2227,8 +2726,9 @@ public class Connection
     /// </para>
     /// </summary>
     /// <param name="failedSocket">The socket whose <see cref="OnConnected"/> handler threw.</param>
+    /// <param name="failedSession">The session that socket serves; its generation is the transition this path continues.</param>
     /// <param name="error">The exception thrown by the handler.</param>
-    private async Task OnConnectHandlerFailedAsync(WebSocketClient failedSocket, Exception error)
+    private async Task OnConnectHandlerFailedAsync(WebSocketClient failedSocket, ConnectionSession failedSession, Exception error)
     {
         var errorHandler = OnError;
         if (errorHandler is not null)
@@ -2315,14 +2815,22 @@ public class Connection
         // Cleared before the sweep below, for the reason given in ChangeServer (issue #177): the
         // socket is open, and a request issued from a rejected continuation would otherwise go into it.
         // Taken after the notification above on purpose: the check that comes with the clear is the
-        // one that sees what the consumer's handler did.
+        // one that sees what the consumer's handler did. The ping timer and the message processor
+        // go in the same critical section - they are this connection's, and a takeover that lands
+        // between the clear and their stop would otherwise have its own torn down.
         bool wasCurrentSocket;
-        lock (_disconnectLock)
+        (Task? task, CancellationTokenSource? cts) detachedProcessor = default;
+        lock (_transitionLock)
         {
             wasCurrentSocket = ReferenceEquals(ws, failedSocket);
             if (wasCurrentSocket)
             {
                 ws = null;
+                StopPingTimerSync();
+                lock (_messageProcessorLock)
+                {
+                    detachedProcessor = DetachMessageProcessor();
+                }
             }
         }
 
@@ -2338,9 +2846,8 @@ public class Connection
             return;
         }
 
-        StopPingTimerSync();
         requestManager.RejectAllWithCancellation();
-        await StopMessageProcessorAsync();
+        await AwaitMessageProcessorExitAsync(detachedProcessor.task, detachedProcessor.cts);
         await WaitForPingToFinishAsync();
 
         // The socket is deliberately NOT marked as user-initiated: OnceClose must treat this as a real
@@ -2348,62 +2855,29 @@ public class Connection
         failedSocket.Cancel();
         failedSocket.Disconnect();
 
-        // Take ownership of the reconnect state instead of asking "is a loop already running?".
-        // This method can run inside the reconnect loop's own attempt: that loop breaks as soon as the
-        // socket reports Open, which happens before the handler has even finished failing. Both this check
-        // and the one in OnceClose would then race with the loop's exit, and losing the race leaves nobody
-        // reconnecting - the very wedge this path exists to prevent. Cancel whatever is there, start fresh;
-        // the later OnceClose sees a live loop and correctly stands down.
-        // Seed the attempt counter with the consecutive-failure count. StopReconnectLoop zeroes
-        // _reconnectAttempts and a fresh sequence would zero it again, and CalcBackoff derives the
-        // delay from that counter alone — so without the seed every handler failure would restart
-        // the backoff at ReconnectBaseDelay. With StopAfterMaxAttempts = false (no give-up branch)
-        // that means connect -> handler failure -> teardown forever at a constant 2s, a sustained
-        // connection load on a node that accepts TCP but cannot serve requests yet.
-        RestartReconnectLoop(initialAttempts: failures);
+        // Continue the transition this socket belongs to. If its loop is running - this method can
+        // run inside the loop's own attempt, and OnceClose for the socket will ask the same
+        // question - the loop carries on with its own counter, which grows per attempt; the
+        // decision is one lock, so there is no exit to race with. Otherwise a loop starts here,
+        // seeded with the consecutive-failure count: a fresh sequence starts its counter at zero,
+        // and CalcBackoff derives the delay from that counter alone - so without the seed every
+        // handler failure would restart the backoff at ReconnectBaseDelay. With
+        // StopAfterMaxAttempts = false (no give-up branch) that means connect -> handler failure ->
+        // teardown forever at a constant 2s, a sustained connection load on a node that accepts
+        // TCP but cannot serve requests yet.
+        StartReconnectLoop(failedSession.Generation, initialAttempts: failures);
     }
 
     /// <summary>
     /// Whether <paramref name="socket"/> is the one installed as the connection right now. Read
-    /// under <c>_disconnectLock</c>, the lock every retirement path clears <c>ws</c> under.
+    /// under <see cref="_transitionLock"/>, the lock every retirement path clears <c>ws</c> under.
     /// </summary>
     private bool IsCurrentSocket(WebSocketClient socket)
     {
-        lock (_disconnectLock)
+        lock (_transitionLock)
         {
             return ReferenceEquals(ws, socket);
         }
-    }
-
-    /// <summary>
-    /// Retires the current reconnect session and installs a fresh one in a single transaction,
-    /// seeding the attempt counter with <paramref name="initialAttempts"/>.
-    /// </summary>
-    /// <remarks>
-    /// Doing this as <c>StopReconnectLoop(); _reconnectLoop = null; StartReconnectLoop(seed);</c>
-    /// took the lock twice with a bare write in between, so a concurrent start (from OnceClose or
-    /// OnConnectionFailed) could slip in and install its own loop; the seeded start would then see
-    /// a live loop, return without applying the seed, and the backoff would silently stop growing
-    /// across consecutive handler failures — the very regression the seed exists to prevent.
-    /// </remarks>
-    private void RestartReconnectLoop(int initialAttempts)
-    {
-        CancellationTokenSource retired;
-        lock (_reconnectStateLock)
-        {
-            retired = _reconnectCts;
-            _reconnectMode = ReconnectMode.LoopReconnect;
-            _isFastReconnectActive = false;
-            _reconnectAttempts = initialAttempts;
-            _reconnectCts = new CancellationTokenSource();
-
-            // Safe to start under the lock: ReconnectLoopAsync reads its token and yields before
-            // anything else, so this only schedules the loop - no consumer notification runs inline.
-            _reconnectLoop = ReconnectLoopAsync(_reconnectCts);
-        }
-
-        retired?.Cancel();
-        retired?.Dispose();
     }
 
     private async Task OnceClose(int? code, string? description, WebSocketClient closingSocket, long sessionId)
@@ -2442,8 +2916,13 @@ public class Connection
         }
 
         // Check if this is the current socket or a stale callback from an old socket
-        var isCurrentSocket = ws == closingSocket;
-        var wsWasNull = ws == null;
+        bool isCurrentSocket;
+        bool wsWasNull;
+        lock (_transitionLock)
+        {
+            isCurrentSocket = ReferenceEquals(ws, closingSocket);
+            wsWasNull = ws == null;
+        }
 
         var isUserInitiated = Interlocked.CompareExchange(
             ref _userInitiatedSocket,
@@ -2470,35 +2949,56 @@ public class Connection
             return;
         }
 
-        // Only for the current socket - and the message processor goes with it, this connection
-        // is over.
-        StopPingTimerSync();
-        await StopMessageProcessorAsync();
+        // Only for the current socket - and the ping timer and the message processor go with it,
+        // this connection is over. Taken in one critical section with the clear of ws: a takeover
+        // that lands between them would otherwise have its own timer and processor torn down. The
+        // clear is conditional for the same reason - a takeover may already have installed a
+        // socket of its own, and that one is not this callback's to clear.
+        (Task? task, CancellationTokenSource? cts) detachedProcessor;
+        lock (_transitionLock)
+        {
+            StopPingTimerSync();
+            lock (_messageProcessorLock)
+            {
+                detachedProcessor = DetachMessageProcessor();
+            }
+
+            if (ReferenceEquals(ws, closingSocket))
+            {
+                ws = null;
+            }
+        }
+
+        await AwaitMessageProcessorExitAsync(detachedProcessor.task, detachedProcessor.cts);
 
         // Check if this is a network drop (FailureReason set by WebSocketClient)
         var isNetworkDrop = closingSocket.FailureReason == SocketFailureReason.NetworkDrop;
-        
+
         // Track network drop socket for immediate reconnect
         if (isNetworkDrop && !intentionalDisconnect)
         {
             _networkDropSocket = closingSocket;
         }
 
-        // For intentional disconnect or network drop, use cancellation (no Critical logging)
-        if (intentionalDisconnect || isNetworkDrop)
+        // The sweep, the state and the loop belong to whoever owns the connection. This socket's
+        // transition owns it unless a later one took over - a user Disconnect() that closed this
+        // socket, a Connect() or ChangeServer issued while it was closing - and that operation is
+        // sweeping and reporting for itself now; rejecting its requests here would reject the
+        // requests of the connection it is building. A callback with no session to name (none
+        // in this class) is taken to be about the current transition.
+        long closingGeneration = closingSession?.Generation ?? CurrentGeneration();
+        if (Owns(closingGeneration))
         {
-            requestManager.RejectAllWithCancellation();
-        }
-        else
-        {
-            requestManager.RejectAll(
-                new DisconnectedException($"websocket was closed, code: {code}, reason: {userMessage}"));
-        }
-
-        // Clear ws reference
-        if (isCurrentSocket)
-        {
-            ws = null;
+            // For intentional disconnect or network drop, use cancellation (no Critical logging)
+            if (intentionalDisconnect || isNetworkDrop)
+            {
+                requestManager.RejectAllWithCancellation();
+            }
+            else
+            {
+                requestManager.RejectAll(
+                    new DisconnectedException($"websocket was closed, code: {code}, reason: {userMessage}"));
+            }
         }
 
         CompleteDisconnectTcs();
@@ -2528,9 +3028,15 @@ public class Connection
             intentionalDisconnect ? SessionEndReason.UserDisconnected : SessionEndReason.ConnectionLost,
             userMessage);
 
+        // Asked again after the two callbacks above: a handler may have moved the client on, and
+        // the state it reports is its own.
+        if (!Owns(closingGeneration))
+        {
+            return;
+        }
+
         if (intentionalDisconnect)
         {
-            _reconnectAttempts = 0;
             var noReconnectMessage = $"Connection closed permanently. {userMessage}";
             SetConnectionState(XrpConnectionState.Disconnected, noReconnectMessage, ConnectionCloseSeverity.Warning);
             return;
@@ -2538,163 +3044,143 @@ public class Connection
 
         if (ShouldReconnect(code) || code == 1000)
         {
-            // Check if reconnect loop is already running - don't reset counter or start new loop
-            var loopIsRunning = _reconnectLoop != null && !_reconnectLoop.IsCompleted;
-            if (!loopIsRunning)
+            // The loop is started before the notification, so an escaping handler cannot cost it,
+            // and only when none is running for this transition - the decision is one lock, so
+            // there is no loop exit to race with. A loop that is running handles the close itself:
+            // it re-checks the socket under the same lock before it releases.
+            ReconnectInfo firstAttempt = BuildReconnectInfo(explicitAttempt: 1);
+            if (StartReconnectLoop(closingGeneration))
             {
-                // Set _reconnectAttempts = 1 before notification so BuildReconnectInfo returns correct value
-                _reconnectAttempts = 1;
                 SetConnectionState(
                     XrpConnectionState.RestoringConnection,
                     userMessage,
                     severity,
-                    reconnect: BuildReconnectInfo());
-                StartReconnectLoop();
+                    reconnect: firstAttempt);
             }
-            // else: loop is already running and will handle reconnection, don't reset _reconnectAttempts
         }
         else
         {
-            _reconnectAttempts = 0;
+            lock (_transitionLock)
+            {
+                if (Owns(closingGeneration))
+                {
+                    _reconnectAttempts = 0;
+                }
+            }
+
             var noReconnectMessage = $"Connection closed permanently. {userMessage}";
             SetConnectionState(XrpConnectionState.Disconnected, noReconnectMessage, ConnectionCloseSeverity.Warning);
         }
     }
 
-    private void StopReconnectLoop()
-    {
-        // Detach under the lock, then cancel/dispose outside it: a start racing with this stop can
-        // no longer have its fresh source torn down, and cancellation callbacks never run while the
-        // lock is held.
-        CancellationTokenSource retired;
-        lock (_reconnectStateLock)
-        {
-            retired = _reconnectCts;
-            _reconnectCts = null;
-            _reconnectAttempts = 0;
-
-            // Drop the task reference too, in the same transaction. The retired loop exits
-            // asynchronously - it only notices it lost ownership on its next check - so leaving the
-            // reference behind makes StartReconnectLoop see `!IsCompleted` and return without
-            // starting anything, while the retired loop then stands down on its ownership check.
-            // Nobody would be reconnecting. Reachable whenever Connect or ChangeServer stops a live
-            // loop and the new connection fails.
-            _reconnectLoop = null;
-        }
-
-        retired?.Cancel();
-        retired?.Dispose();
-        // Note: Do NOT clear _reconnectMode here!
-        // _reconnectMode is cleared only by:
-        // - OnceOpen (connection succeeded)
-        // - End of ReconnectLoopAsync (loop terminated)
-        // - ClearReconnectState (user-initiated disconnect)
-        // This prevents race conditions where StopReconnectLoop is called during
-        // fast reconnect transitions (RetireCurrentSessionAndReconnectAsync)
-        _isFastReconnectActive = false; // Legacy flag for backward compatibility
-    }
-    
     /// <summary>
-    /// Clears all reconnect state. Only called when connection is stable or user disconnects.
+    /// Starts the reconnect loop for <paramref name="generation"/>, unless that transition no
+    /// longer owns the connection or its loop is already running. Reuses the cancellation source
+    /// the fast reconnect installed when there is one; a fresh sequence starts its attempt counter
+    /// at <paramref name="initialAttempts"/>, so the first delay of a fresh sequence is
+    /// <c>CalcBackoff(1)</c> - twice <c>ReconnectBaseDelay</c> - except on the ping-timeout and
+    /// network-drop paths, where the first attempt skips the delay entirely.
     /// </summary>
-    private void ClearReconnectState()
+    /// <remarks>
+    /// The whole decision - does the transition still own the connection, is its loop already
+    /// running, is the current source reusable, install a fresh one, hand it to the new loop - is
+    /// one critical section under <see cref="_transitionLock"/>, the same lock the loop releases
+    /// itself under. Split, it would race with that release and with another start: two loops
+    /// could end up running, or none.
+    /// </remarks>
+    /// <returns>Whether a loop was started.</returns>
+    private bool StartReconnectLoop(long generation, int initialAttempts = 0)
     {
-        StopReconnectLoop();
-        _reconnectMode = ReconnectMode.None;
-    }
-
-    /// <summary>
-    /// Starts a reconnect loop unless one is already running, reusing a pre-created cancellation
-    /// source when there is one. A fresh sequence starts its attempt counter at zero, so the first
-    /// delay is <c>CalcBackoff(1)</c> — twice <c>ReconnectBaseDelay</c> — except on the
-    /// ping-timeout and network-drop paths, where the first attempt skips the delay entirely. The
-    /// OnConnected-handler path needs a seeded counter instead and uses
-    /// <see cref="RestartReconnectLoop"/>.
-    /// </summary>
-    private void StartReconnectLoop()
-    {
-        // Set reconnect mode to LoopReconnect (upgrades from FastReconnect or sets from None)
-        _reconnectMode = ReconnectMode.LoopReconnect;
-
-        // The whole decision — is a loop already running, is the current source reusable, install a
-        // fresh one, hand it to the new loop — is one transaction. Split across the lock it would
-        // race with StopReconnectLoop and with another start: two loops could end up running, or a
-        // loop could be handed a source that a concurrent stop has already disposed.
         CancellationTokenSource retired = null;
-        lock (_reconnectStateLock)
+        lock (_transitionLock)
         {
-            // CRITICAL: If a loop is already running, don't start another or reset the counter
-            // This prevents _reconnectAttempts from being reset mid-loop when callbacks trigger
-            // reconnect logic (OnceClose, OnConnectionFailed, etc.)
-            var loopIsRunning = _reconnectLoop != null && !_reconnectLoop.IsCompleted;
-            if (loopIsRunning)
+            if (_generation != generation || _reconnectLoopGeneration == generation)
             {
-                // Loop is already running - let it continue, don't reset _reconnectAttempts
-                return;
+                return false;
             }
 
-            // If we have a valid pre-created CTS (from RetireCurrentSessionAndReconnectAsync),
-            // we should reuse it. Check for this case first.
-            var existingCts = _reconnectCts;
-            var hasValidPreCreatedCts = existingCts != null && !existingCts.IsCancellationRequested;
+            // Set reconnect mode to LoopReconnect (upgrades from FastReconnect or sets from None)
+            _reconnectMode = ReconnectMode.LoopReconnect;
 
-            // If no valid pre-created CTS, create a new one
-            // Only reset _reconnectAttempts when creating a FRESH CTS (new reconnect sequence)
-            if (!hasValidPreCreatedCts)
+            // A valid pre-created source (from the fast reconnect) is reused, and the sequence it
+            // belongs to continues with its counter - the seed only ever raises it. Otherwise a
+            // fresh sequence starts on a fresh source.
+            CancellationTokenSource existingCts = _reconnectCts;
+            bool hasValidPreCreatedCts = existingCts != null && !existingCts.IsCancellationRequested;
+            if (hasValidPreCreatedCts)
             {
-                // Retire the old CTS after the lock is released - see _reconnectStateLock
+                _reconnectAttempts = Math.Max(_reconnectAttempts, initialAttempts);
+            }
+            else
+            {
+                // Retire the old source after the lock is released - see _transitionLock
                 retired = existingCts;
                 _reconnectCts = new CancellationTokenSource();
-                _reconnectAttempts = 0;
+                _reconnectAttempts = initialAttempts;
             }
-            // else: Reuse existing valid CTS (pre-created for fast reconnect)
-            // Don't reset _reconnectAttempts - this is continuation of existing reconnect sequence
-            // Note: _reconnectLoop was already cleared by RetireCurrentSessionAndReconnectAsync
 
-            // Safe to start under the lock: ReconnectLoopAsync yields before touching anything, so
-            // this call only schedules the loop and returns - no consumer notification runs inline.
-            _reconnectLoop = ReconnectLoopAsync(_reconnectCts);
+            _reconnectLoopGeneration = generation;
+
+            // Safe to start under the lock: ReconnectLoopAsync reads its token and yields before
+            // anything else, so this only schedules the loop - no consumer notification runs inline.
+            _ = ReconnectLoopAsync(generation, _reconnectCts);
         }
 
         retired?.Cancel();
         retired?.Dispose();
+        return true;
     }
 
-    private async Task ReconnectLoopAsync(CancellationTokenSource ownCts)
+    /// <summary>
+    /// Releases the loop's claim on the reconnect state, for a loop that connected. Must be called
+    /// with <see cref="_transitionLock"/> held, by a loop that still owns its generation. The
+    /// source comes out for the caller to dispose outside the lock.
+    /// </summary>
+    private CancellationTokenSource? ReleaseReconnectLoopLocked(CancellationTokenSource ownCts)
     {
-        // The CTS this loop owns. StopReconnectLoop cancels without awaiting the loop, so a retired loop
-        // can still be running - or reach its tail - after a replacement has been installed. Everything
-        // this loop writes to shared reconnect state is therefore guarded by an ownership check.
+        _reconnectLoopGeneration = 0;
+        _reconnectAttempts = 0;
+
+        if (!ReferenceEquals(_reconnectCts, ownCts))
+        {
+            return null;
+        }
+
+        _reconnectCts = null;
+        return ownCts;
+    }
+
+    private async Task ReconnectLoopAsync(long generation, CancellationTokenSource ownCts)
+    {
+        // The source this loop runs on. A takeover cancels it without awaiting the loop, so a
+        // retired loop can still be running - or reach its tail - after another transition has
+        // begun. Everything this loop writes to shared state is therefore guarded by an ownership
+        // check on its generation, under the lock.
         //
         // Read BEFORE the yield below, and deliberately so: the caller still holds
-        // _reconnectStateLock here, so this source cannot yet have been retired. After the yield a
-        // concurrent stop may already have disposed it - Cancel/Dispose of a retired source run
+        // _transitionLock here, so this source cannot yet have been retired. After the yield a
+        // concurrent takeover may already have disposed it - Cancel/Dispose of a retired source run
         // outside the lock - and CancellationTokenSource.Token throws ObjectDisposedException once
         // disposed. Taken after the yield, that throw would land outside every try below, faulting
         // the loop before its first attempt and vanishing as an unobserved task exception.
         CancellationToken ct = ownCts.Token;
 
         // Yield so nothing beyond that read runs inline on the caller: StartReconnectLoop starts the
-        // loop while holding _reconnectStateLock, and a consumer notification executing under that
+        // loop while holding _transitionLock, and a consumer notification executing under that
         // lock could deadlock against any path that takes it (Disconnect from a handler, say).
         await Task.Yield();
 
-        // Don't reset _reconnectAttempts here - it may be pre-set to 1 by fast reconnect path
-        // StartReconnectLoop() sets it to 0 when creating a new CTS
-        
         // Clear fast reconnect flag - reconnect loop has taken ownership
-        // This must happen AFTER _reconnectCts is valid (which StartReconnectLoop ensures)
-        // so any pending OnConnectionFailed callbacks still see IsReconnectActive()=true via CTS
         _isFastReconnectActive = false;
-        
+
         // For ping timeout or network drop, first attempt should be immediate (no delay)
         var isImmediateReconnect = _pingTimeoutSocket != null || _networkDropSocket != null;
 
         while (!ct.IsCancellationRequested)
         {
-            if (!ReferenceEquals(_reconnectCts, ownCts))
+            if (!Owns(generation))
             {
-                // Retired: a newer loop owns the reconnect sequence now.
+                // Superseded: a later transition owns the connection now.
                 break;
             }
 
@@ -2703,9 +3189,9 @@ public class Connection
             // Skip delay for first attempt if this is immediate reconnect (ping timeout or network drop)
             var skipDelay = isImmediateReconnect && _reconnectAttempts == 1;
             isImmediateReconnect = false; // Only affects first attempt
-            
+
             var delay = skipDelay ? TimeSpan.Zero : CalcBackoff(_reconnectAttempts);
-            var reconnectMessage = skipDelay 
+            var reconnectMessage = skipDelay
                 ? "Reconnecting immediately..."
                 : $"Reconnecting in {delay.TotalSeconds:F1} seconds... (attempt #{_reconnectAttempts})";
             var type = ConnectionCloseSeverity.Info;
@@ -2743,57 +3229,54 @@ public class Connection
                 }
                 catch (ObjectDisposedException)
                 {
-                    // The source this loop owns was retired and disposed while the delay was being
-                    // set up: registering a callback on a token whose source is gone throws instead
-                    // of cancelling. Same meaning as cancellation - a newer sequence owns the
-                    // reconnect state now - so leave quietly rather than fault the task.
+                    // The source this loop runs on was retired and disposed while the delay was
+                    // being set up: registering a callback on a token whose source is gone throws
+                    // instead of cancelling. Same meaning as cancellation - a later transition owns
+                    // the connection now - so leave quietly rather than fault the task.
                     break;
                 }
             }
 
-            if (ct.IsCancellationRequested)
+            if (ct.IsCancellationRequested || !Owns(generation))
             {
                 break;
             }
 
             try
             {
-                // =====================================================
-                // SESSION ISOLATION (same as ChangeServer)
-                // =====================================================
-                // Somebody else connected while this loop was waiting out its delay - another
-                // attempt on the same source, or the fast-reconnect path. Whatever is in ws is live,
-                // and retiring it below would trade a healthy connection for a reconnect nobody
-                // needed. Every path that starts this loop does so because the connection is gone,
-                // so an open socket here always belongs to someone who got there first.
-                if (IsConnected())
+                // Retire the previous attempt's session and socket - under the lock, without a
+                // takeover: this is the same transition, one attempt further on. An open socket
+                // here means the transition connected by some other means while this loop was
+                // waiting out its delay; the loop is done then, and retiring a healthy connection
+                // would trade it for a reconnect nobody needed.
+                ConnectionSession? oldSession = null;
+                WebSocketClient? oldSocket = null;
+                CancellationTokenSource? releasedBeforeAttempt = null;
+                bool alreadyConnected;
+                lock (_transitionLock)
                 {
-                    lock (_reconnectStateLock)
+                    if (!Owns(generation))
                     {
-                        if (ReferenceEquals(_reconnectCts, ownCts))
-                        {
-                            _reconnectAttempts = 0;
-                        }
+                        break;
                     }
 
-                    break;
+                    alreadyConnected = ShouldBeConnected();
+                    if (alreadyConnected)
+                    {
+                        releasedBeforeAttempt = ReleaseReconnectLoopLocked(ownCts);
+                    }
+                    else
+                    {
+                        DetachLocked(retireSession: true, out oldSession, out oldSocket);
+                    }
                 }
 
-                // Mark old session as retiring before creating new connection
-                // so late callbacks from old socket are properly ignored.
-                ConnectionSession? oldSession;
-                WebSocketClient? oldSocket;
-                lock (_sessionLock)
+                if (alreadyConnected)
                 {
-                    oldSession = _activeSession;
-                    oldSession?.MarkAsRetiring();
+                    releasedBeforeAttempt?.Dispose();
+                    return;
                 }
-                lock (_disconnectLock)
-                {
-                    oldSocket = ws;
-                    ws = null;
-                }
-                
+
                 // Mark old socket for intentional disconnect (per-socket tracking)
                 if (oldSocket != null)
                 {
@@ -2803,36 +3286,54 @@ public class Connection
                     _ = RetireOldSessionAsync(oldSession, oldSocket);
                 }
 
-                await ConnectInternalAsync(ct);
+                await ConnectCoreAsync(generation, ct);
 
-                if (IsConnected())
+                // Release under the lock, with the socket re-checked under the same lock. This is
+                // the window OnceClose used to fall into: the loop saw an open socket, broke out,
+                // and a close processed before its task completed saw a running loop that was
+                // about to exit and started nothing. Now a close either sees the loop released
+                // (and starts a new one) or sees it running - and the loop, taking the lock next,
+                // sees the socket closed and goes round again.
+                CancellationTokenSource? released = null;
+                bool settled;
+                lock (_transitionLock)
                 {
-                    // Ownership check and the write it guards belong together: checked outside the
-                    // lock, this loop could be retired in between and reset a live sequence's counter.
-                    lock (_reconnectStateLock)
+                    if (!Owns(generation))
                     {
-                        if (ReferenceEquals(_reconnectCts, ownCts))
-                        {
-                            _reconnectAttempts = 0;
-                        }
+                        break;
                     }
 
-                    break;
+                    settled = ShouldBeConnected();
+                    if (settled)
+                    {
+                        released = ReleaseReconnectLoopLocked(ownCts);
+                    }
+                }
+
+                if (settled)
+                {
+                    released?.Dispose();
+                    return;
                 }
             }
             catch (OperationCanceledException)
             {
-                // Reconnect loop was cancelled (e.g., by ChangeServer or StopReconnectLoop)
-                // Exit the loop quietly without logging an error
+                // Cancelled by a takeover - ChangeServer, Connect, Disconnect. Exit quietly.
                 Debug.WriteLine($"{DateTime.Now}Reconnect loop cancelled");
                 break;
             }
             catch (Exception ex)
             {
+                // A later transition owns the connection: its state is its own to report.
+                if (!Owns(generation))
+                {
+                    break;
+                }
+
                 // For network exceptions, use Warning severity to avoid Critical logging in consuming apps
                 var isNetworkError = IsNetworkDropException(ex);
                 var severity = isNetworkError ? ConnectionCloseSeverity.Warning : ConnectionCloseSeverity.Error;
-                var errorMessage = isNetworkError 
+                var errorMessage = isNetworkError
                     ? $"Reconnection attempt #{_reconnectAttempts}: network unavailable"
                     : $"Reconnection attempt #{_reconnectAttempts} failed: {ex.Message}";
                 SetConnectionState(
@@ -2847,37 +3348,35 @@ public class Connection
         // This ensures late callbacks from ping-timeout socket are still filtered
         // even if reconnect attempts fail
 
-        // A newer loop may already have taken over (this one was retired by StopReconnectLoop, which does
-        // not await it). Its state belongs to that loop: clearing the mode or disposing the CTS here would
-        // strand the live reconnect sequence.
-        if (!ReferenceEquals(_reconnectCts, ownCts))
+        // Exited without connecting: cancelled, or out of attempts. If a later transition owns the
+        // connection, its state is its own - the takeover that superseded this loop cleared the
+        // loop's claim as part of taking over. Otherwise the claim is released here, and the
+        // source is disposed when the sequence is over for good.
+        CancellationTokenSource finished = null;
+        lock (_transitionLock)
         {
-            return;
-        }
-
-        // When loop exits (cancelled, max attempts, or success) and connection is not established,
-        // clear the reconnect mode. If connected, OnceOpen already cleared it.
-        if (!IsConnected())
-        {
-            _reconnectMode = ReconnectMode.None;
-        }
-
-        if (config.StopAfterMaxAttempts && _reconnectAttempts >= config.MaxReconnectAttempts)
-        {
-            // Re-check ownership inside the lock: between the check above and here a new sequence
-            // could have installed its own source, and disposing that one would strand it.
-            CancellationTokenSource finished = null;
-            lock (_reconnectStateLock)
+            if (!Owns(generation) || _reconnectLoopGeneration != generation)
             {
-                if (ReferenceEquals(_reconnectCts, ownCts))
-                {
-                    finished = _reconnectCts;
-                    _reconnectCts = null;
-                }
+                return;
             }
 
-            finished?.Dispose();
+            _reconnectLoopGeneration = 0;
+
+            if (!ShouldBeConnected())
+            {
+                _reconnectMode = ReconnectMode.None;
+            }
+
+            if (config.StopAfterMaxAttempts &&
+                _reconnectAttempts >= config.MaxReconnectAttempts &&
+                ReferenceEquals(_reconnectCts, ownCts))
+            {
+                finished = _reconnectCts;
+                _reconnectCts = null;
+            }
         }
+
+        finished?.Dispose();
     }
 
     private volatile int _pingRunning = 0;
@@ -2952,7 +3451,7 @@ public class Connection
             }
 
             WebSocketClient? currentSocket;
-            lock (_disconnectLock)
+            lock (_transitionLock)
             {
                 currentSocket = ws;
             }
@@ -2973,8 +3472,8 @@ public class Connection
             if (!IsConnected())
             {
                 Debug.WriteLine($"{DateTime.Now}[PING-CHECK] Not connected (State={State()}), triggering reconnect");
-                _pingTimeoutSocket = ws;
-                await RetireCurrentSessionAndReconnectAsync($"Ping detected disconnected state ({State()}).");
+                _pingTimeoutSocket = currentSocket;
+                await RetireCurrentSessionAndReconnectAsync($"Ping detected disconnected state ({State()}).", currentSocket);
                 return;
             }
 
@@ -2992,10 +3491,11 @@ public class Connection
             double inactivityLimit = config.InactivityTimeout.TotalSeconds;
             if (timeSinceLastActivity > inactivityLimit)
             {
-                _pingTimeoutSocket = ws;
+                _pingTimeoutSocket = currentSocket;
 
                 await RetireCurrentSessionAndReconnectAsync(
-                    $"Connection timeout (no activity for {inactivityLimit:F0}+ seconds).");
+                    $"Connection timeout (no activity for {inactivityLimit:F0}+ seconds).",
+                    currentSocket);
                 return;
             }
 
@@ -3068,9 +3568,9 @@ public class Connection
 
                 Debug.WriteLine($"{DateTime.Now}Ping request error: {pingEx.Message}");
 
-                _pingTimeoutSocket = ws;
+                _pingTimeoutSocket = currentSocket;
 
-                await RetireCurrentSessionAndReconnectAsync("Ping failed.");
+                await RetireCurrentSessionAndReconnectAsync("Ping failed.", currentSocket);
                 return;
             }
         }
@@ -3445,20 +3945,6 @@ public class Connection
                 }
             }, cts.Token);
         }
-    }
-
-    /// <summary>
-    /// Stops the background message processor and disposes resources.
-    /// </summary>
-    private Task StopMessageProcessorAsync()
-    {
-        (Task? task, CancellationTokenSource? cts) detached;
-        lock (_messageProcessorLock)
-        {
-            detached = DetachMessageProcessor();
-        }
-
-        return AwaitMessageProcessorExitAsync(detached.task, detached.cts);
     }
 
     /// <summary>
@@ -3890,7 +4376,7 @@ public class Connection
     /// <remarks>
     /// Matching the id is not enough: <c>ChangeServer</c> and the reconnect loop call
     /// <c>MarkAsRetiring()</c> on the session while it is still <c>_activeSession</c>, and only
-    /// <c>ConnectInternalAsync</c> installs its replacement. Frames arriving in that window carry
+    /// <c>ConnectCoreAsync</c> installs its replacement. Frames arriving in that window carry
     /// the id of the very session being retired, so the retiring flag is part of the test - as
     /// <c>OnceOpen</c> and the other lifecycle guards do it, and under the same lock, since
     /// <c>IsRetiring</c> is a plain bool published only by <c>_sessionLock</c>.
