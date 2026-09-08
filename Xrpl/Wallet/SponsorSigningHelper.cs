@@ -101,24 +101,6 @@ namespace Xrpl.Wallet
         public static byte[] GetSponsorPreimage(JsonObject txJson)
             => CoSigningEngine.GetSigningPreimage(txJson, CoSigningEngine.PrefixFor("SponsorSignature"));
 
-        /// <summary>
-        /// Removed: the sponsor and the submitter no longer sign the same bytes, so one method
-        /// cannot mean both. Use <see cref="GetSponsorPreimage"/> for the sponsor's bytes and
-        /// <see cref="XrplBinaryCodec.EncodeForSigning(object)"/> for the submitter's.
-        /// </summary>
-        /// <remarks>
-        /// Kept as a member that refuses rather than deleted outright. Deleted, a consumer built
-        /// against the old assembly binds to a method that is gone and fails with
-        /// MissingMethodException, and one rebuilding from source gets "no such member" with
-        /// nothing to act on. Kept and returning the sponsor bytes, a consumer using it for the
-        /// submitter's signature would keep compiling and start producing signatures the node
-        /// refuses - the silent outcome this whole change exists to remove.
-        /// </remarks>
-        [Obsolete("Signing roles cover different bytes since rippled's fixCleanup3_4_0. Use GetSponsorPreimage() for the sponsor's signature, or XrplBinaryCodec.EncodeForSigning(tx) for the submitter's own.", error: true)]
-        public static byte[] GetSigningPreimage(JsonObject txJson)
-            => throw new NotSupportedException(
-                "SponsorSigningHelper.GetSigningPreimage returned the bytes of both the sponsor's and the submitter's signature while they were the same. " +
-                "They differ since rippled's fixCleanup3_4_0: use GetSponsorPreimage() for the sponsor, or XrplBinaryCodec.EncodeForSigning(tx) for the submitter.");
 
         internal static void VerifySponsorMatches(JsonObject tx, XrplWallet sponsorWallet)
         {
