@@ -199,7 +199,7 @@ namespace Xrpl.Wallet
         /// Computes the bytes the borrower signs into CounterpartySignature: the transaction
         /// under the counterparty prefix, which since fixCleanup3_4_0 is not what the broker signs.
         /// </summary>
-        internal static byte[] GetSigningPreimage(JsonObject txJson)
+        internal static byte[] GetCounterpartyPreimage(JsonObject txJson)
             => CoSigningEngine.GetSigningPreimage(txJson, CoSigningEngine.PrefixFor("CounterpartySignature"));
 
     }

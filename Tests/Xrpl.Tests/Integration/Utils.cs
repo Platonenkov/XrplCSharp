@@ -481,8 +481,16 @@ namespace XrplTests.Xrpl.ClientLib.Integration
             TestNodeType? nodeType = null,
             TimeSpan? budget = null)
         {
-            TimeSpan limit = budget ?? TimeSpan.FromSeconds(120);
             System.Diagnostics.Stopwatch elapsed = System.Diagnostics.Stopwatch.StartNew();
+            DateTime seenFirst = await ValidatedCloseTimeAsync(client);
+
+            // The budget follows the wait rather than a constant, because the two are the same
+            // quantity seen from opposite ends: a mark 180 s away cannot be reached inside 120 s,
+            // and a fixed default turns that into "the node stalled". The slack covers the ledger
+            // the mark has to be strictly passed by, plus the poll interval.
+            TimeSpan limit = budget ?? (seenFirst >= target
+                ? TimeSpan.FromSeconds(30)
+                : target - seenFirst + TimeSpan.FromSeconds(60));
 
             while (true)
             {

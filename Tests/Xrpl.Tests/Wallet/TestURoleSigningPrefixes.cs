@@ -1,6 +1,9 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
@@ -11,21 +14,79 @@ using Xrpl.Wallet;
 namespace Xrpl.Tests.Wallet.Tests
 {
     /// <summary>
-    /// The four-byte prefixes rippled's <c>fixCleanup3_4_0</c> gives the signing roles, checked
-    /// against the protocol rather than against a captured output.
+    /// The four-byte prefixes that go in front of a signing preimage, read out of rippled's own
+    /// <c>HashPrefix.h</c> rather than restated.
     /// </summary>
     /// <remarks>
-    /// A pinned blob cannot say whether a preimage is right: regenerate it from the same code and
-    /// it agrees with itself. What is checkable without a node is the shape of the change rippled
-    /// describes: a role preimage is the transaction's own preimage with a different four-byte
-    /// prefix, and the prefixes are ASCII tags built by <c>makeHashPrefix</c> in
-    /// <c>include/xrpl/protocol/HashPrefix.h</c>. Everything past those four bytes must be
-    /// identical, or the roles would be signing different transactions rather than the same one
-    /// in different capacities.
+    /// A wrong prefix is invisible to a test that names it: the SDK signs and verifies with the
+    /// same constant, agrees with itself, and only a node refuses the signature. So the values
+    /// come from the vendored header (<c>Fixtures/HashPrefix.h</c>, see its <c>.ref</c>) and the
+    /// shape of a role preimage is checked against the protocol's own rule - the transaction's
+    /// preimage with four bytes in front of it, and nothing else different.
     /// </remarks>
     [TestClass]
     public class TestURoleSigningPrefixes
     {
+        /// <summary>rippled <c>makeHashPrefix</c>: three ASCII letters, then a zero byte.</summary>
+        private static readonly Regex Declaration = new Regex(
+            @"(?<name>\w+)\s*=\s*detail::makeHashPrefix\('(?<a>.)',\s*'(?<b>.)',\s*'(?<c>.)'\)",
+            RegexOptions.Compiled);
+
+        private static string FixturePath => Path.Combine(AppContext.BaseDirectory, "Fixtures", "HashPrefix.h");
+
+        /// <summary>rippled's name for each prefix -> the name this SDK gives the same value.</summary>
+        private static readonly Dictionary<string, HashPrefix> Mapping = new(StringComparer.Ordinal)
+        {
+            ["TxSign"] = HashPrefix.TransactionSig,
+            ["TxMultiSign"] = HashPrefix.TransactionMultiSig,
+            ["CounterpartyTxSign"] = HashPrefix.CounterpartyTransactionSig,
+            ["CounterpartyTxMultiSign"] = HashPrefix.CounterpartyTransactionMultiSig,
+            ["SponsorTxSign"] = HashPrefix.SponsorTransactionSig,
+            ["SponsorTxMultiSign"] = HashPrefix.SponsorTransactionMultiSig,
+            ["Batch"] = HashPrefix.Batch,
+            ["PaymentChannelClaim"] = HashPrefix.PaymentChannelClaim,
+        };
+
+        private static Dictionary<string, uint> ParseUpstream()
+        {
+            if (!File.Exists(FixturePath))
+                throw new InvalidOperationException($"Vendored HashPrefix.h not found at {FixturePath}");
+
+            string header = File.ReadAllText(FixturePath);
+            Dictionary<string, uint> values = new(StringComparer.Ordinal);
+
+            foreach (Match match in Declaration.Matches(header))
+            {
+                uint value = ((uint)match.Groups["a"].Value[0] << 24)
+                    | ((uint)match.Groups["b"].Value[0] << 16)
+                    | ((uint)match.Groups["c"].Value[0] << 8);
+                values[match.Groups["name"].Value] = value;
+            }
+
+            // Guards the guard: a regex that stopped matching would make every assertion below
+            // pass over an empty table.
+            if (values.Count < Mapping.Count)
+            {
+                throw new InvalidOperationException(
+                    $"Parsed only {values.Count} prefixes from the vendored HashPrefix.h; the header layout changed, " +
+                    "update the parser before trusting this test");
+            }
+
+            return values;
+        }
+
+        [TestMethod]
+        public void TestUPrefixes_MatchTheVendoredProtocolHeader()
+        {
+            Dictionary<string, uint> upstream = ParseUpstream();
+
+            foreach (KeyValuePair<string, HashPrefix> pair in Mapping)
+            {
+                Assert.IsTrue(upstream.ContainsKey(pair.Key), $"rippled declares no prefix named {pair.Key}");
+                Assert.AreEqual(upstream[pair.Key], (uint)pair.Value, $"{pair.Key} (rippled) vs {pair.Value} (SDK)");
+            }
+        }
+
         private static JsonObject SampleTransaction()
         {
             XrplWallet submitter = XrplWallet.FromSeed("sEdVJXQmtqNy1pp8uMqsqgxMGL9QdzP");
@@ -41,20 +102,6 @@ namespace Xrpl.Tests.Wallet.Tests
                 ["Sequence"] = 7u,
                 ["SigningPubKey"] = submitter.PublicKey,
             };
-        }
-
-        /// <summary>rippled <c>makeHashPrefix</c>: three ASCII letters, then a zero byte.</summary>
-        private static uint Tag(char a, char b, char c) => ((uint)a << 24) | ((uint)b << 16) | ((uint)c << 8);
-
-        [TestMethod]
-        public void TestURolePrefixes_MatchTheProtocolTags()
-        {
-            Assert.AreEqual(Tag('S', 'T', 'X'), (uint)HashPrefix.TransactionSig, "TxSign");
-            Assert.AreEqual(Tag('S', 'M', 'T'), (uint)HashPrefix.TransactionMultiSig, "TxMultiSign");
-            Assert.AreEqual(Tag('C', 'P', 'T'), (uint)HashPrefix.CounterpartyTransactionSig, "CounterpartyTxSign");
-            Assert.AreEqual(Tag('C', 'P', 'M'), (uint)HashPrefix.CounterpartyTransactionMultiSig, "CounterpartyTxMultiSign");
-            Assert.AreEqual(Tag('S', 'P', 'N'), (uint)HashPrefix.SponsorTransactionSig, "SponsorTxSign");
-            Assert.AreEqual(Tag('S', 'P', 'M'), (uint)HashPrefix.SponsorTransactionMultiSig, "SponsorTxMultiSign");
         }
 
         [TestMethod]

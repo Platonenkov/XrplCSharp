@@ -73,8 +73,11 @@ public class TestIClosedEndedVault : TestIVaultBase
         XrplWallet wallet = XrplWallet.Generate();
         await IntegrationTestConfig.TryFundWalletAsync(client, wallet, nodeType);
 
+        // 30 s of subscription phase, because the window has to cover the VaultCreate and the
+        // deposit that follows, and each waits for a validated ledger of its own; the same pair
+        // is budgeted the same way in TestILoanBase. 180 s of investment is rippled's minimum.
         DateTime closeTime = await IntegrationTestConfig.ValidatedCloseTimeAsync(client);
-        DateTime subscriptionDate = WholeSeconds(closeTime.AddSeconds(20));
+        DateTime subscriptionDate = WholeSeconds(closeTime.AddSeconds(30));
         DateTime redemptionDate = subscriptionDate.AddSeconds(180);
 
         VaultCreate createTx = new VaultCreate

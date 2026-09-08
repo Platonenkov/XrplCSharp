@@ -36,6 +36,9 @@
                 <None Update="Fixtures\transactions.macro">
                         <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
                 </None>
+                <None Update="Fixtures\HashPrefix.h">
+                        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+                </None>
                 <None Update="Fixtures\LedgerFormats.h">
                         <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
                 </None>

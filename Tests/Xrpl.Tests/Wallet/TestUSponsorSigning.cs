@@ -61,7 +61,7 @@ namespace Xrpl.Tests.Wallet.Tests
             JsonObject preimageTx = decoded.DeepClone().AsObject();
             preimageTx.Remove("SponsorSignature");
             preimageTx.Remove("TxnSignature");
-            byte[] preimage = SponsorSigningHelper.GetSigningPreimage(preimageTx);
+            byte[] preimage = SponsorSigningHelper.GetSponsorPreimage(preimageTx);
 
             Assert.IsTrue(XrplKeypairs.Verify(preimage, sponsorSig["TxnSignature"]!.GetValue<string>(), sponsor.PublicKey),
                 "SponsorSignature must verify over the sponsor preimage.");
@@ -93,7 +93,7 @@ namespace Xrpl.Tests.Wallet.Tests
             JsonObject preimageTx = decoded.DeepClone().AsObject();
             preimageTx.Remove("SponsorSignature");
             preimageTx.Remove("TxnSignature");
-            byte[] preimage = SponsorSigningHelper.GetSigningPreimage(preimageTx);
+            byte[] preimage = SponsorSigningHelper.GetSponsorPreimage(preimageTx);
 
             Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["SponsorSignature"]!["TxnSignature"]!.GetValue<string>(), sponsor.PublicKey),
                 "Combined SponsorSignature must verify over the sponsor preimage.");
@@ -120,7 +120,7 @@ namespace Xrpl.Tests.Wallet.Tests
             JsonObject preimageTx = decoded.DeepClone().AsObject();
             preimageTx.Remove("SponsorSignature");
             preimageTx.Remove("TxnSignature");
-            byte[] preimage = SponsorSigningHelper.GetSigningPreimage(preimageTx);
+            byte[] preimage = SponsorSigningHelper.GetSponsorPreimage(preimageTx);
 
             Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["SponsorSignature"]!["TxnSignature"]!.GetValue<string>(), sponsor.PublicKey));
             Assert.IsTrue(XrplKeypairs.Verify(SubmitterPreimage(preimageTx), decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey));
@@ -159,8 +159,8 @@ namespace Xrpl.Tests.Wallet.Tests
             withoutSig.Remove("SponsorSignature");
 
             CollectionAssert.AreEqual(
-                SponsorSigningHelper.GetSigningPreimage(withoutSig),
-                SponsorSigningHelper.GetSigningPreimage(withSig),
+                SponsorSigningHelper.GetSponsorPreimage(withoutSig),
+                SponsorSigningHelper.GetSponsorPreimage(withSig),
                 "SponsorSignature must not affect the signing preimage (kNotSigning).");
 
             // ...but must round-trip through the binary encoding

@@ -92,7 +92,13 @@ namespace Xrpl.Wallet
         /// Computes the bytes the sponsor signs into SponsorSignature: the transaction under the
         /// sponsor prefix, which since fixCleanup3_4_0 is not what the submitter signs.
         /// </summary>
-        public static byte[] GetSigningPreimage(JsonObject txJson)
+        /// <remarks>
+        /// Named for the role rather than kept as <c>GetSigningPreimage</c>: that name returned the
+        /// bytes of both signatures while they were the same, and leaving it would have changed
+        /// what a call means without changing how it compiles. The submitter's own bytes come from
+        /// <see cref="XrplBinaryCodec.EncodeForSigning(object)"/>.
+        /// </remarks>
+        public static byte[] GetSponsorPreimage(JsonObject txJson)
             => CoSigningEngine.GetSigningPreimage(txJson, CoSigningEngine.PrefixFor("SponsorSignature"));
 
         internal static void VerifySponsorMatches(JsonObject tx, XrplWallet sponsorWallet)

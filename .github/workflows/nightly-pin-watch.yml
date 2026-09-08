@@ -197,11 +197,14 @@ jobs:
           echo "$out"
           # 0 is in sync and 1 is drift; anything else is the tool failing to answer at all,
           # and an empty grep would then reach the PR body as "no differences reported".
+          # What goes into the output stays text this file chose: the PR-body step pastes it
+          # into its own shell source, where a quote from a stack trace ends the string and a
+          # $(...) in it runs. The tool's own output is above, in this step's log.
           if [ "$status" -eq 0 ] || [ "$status" -eq 1 ]; then
             summary=$(printf '%s\n' "$out" | grep -E 'node-only|mismatch|^Summary')
             [ -n "$summary" ] || summary='no differences reported'
           else
-            summary=$(printf 'the definitions diff did not run (exit %s), so this section says nothing about drift:\n%s' "$status" "$out")
+            summary=$(printf 'the definitions diff did not run (exit %s), so this section says nothing about drift; the step log above has the output' "$status")
           fi
           {
             echo 'summary<<EOF'

@@ -657,17 +657,18 @@ namespace Xrpl.Wallet
         {
             GuardMemos(transaction);
 
-            if (!multisign)
-            {
-                return role switch
-                {
-                    SignatureRole.Sponsor => SignAsSponsor(transaction),
-                    SignatureRole.Counterparty => SignAsLoanCounterparty(transaction),
-                    _ => Sign(transaction, false, signingFor),
-                };
-            }
+            if (role is SignatureRole.Sponsor)
+                return multisign ? SignMulti(transaction, NormalizeClassic(signingFor), role) : SignAsSponsor(transaction);
 
-            return SignMulti(transaction, NormalizeClassic(signingFor), role);
+            if (role is SignatureRole.Counterparty)
+                return multisign ? SignMulti(transaction, NormalizeClassic(signingFor), role) : SignAsLoanCounterparty(transaction);
+
+            // The transaction's own signature. A single one is produced directly rather than
+            // through the routing overload, which would send a wallet the transaction names as
+            // its Sponsor or Counterparty to the co-signature path - the opposite of what was
+            // asked for. A multi-signature entry goes back through that overload on purpose: it
+            // carries the Batch inner-signer routing, which this overload must not skip.
+            return multisign ? Sign(transaction, true, signingFor) : SignPlain(transaction);
         }
 
         /// <summary>
@@ -741,41 +742,46 @@ namespace Xrpl.Wallet
                 var signerAccount = NormalizeClassic(signingFor);
                 return SignMulti(transaction, signerAccount);
             }
-            else
+            return SignPlain(transaction);
+        }
+
+        /// <summary>
+        /// The transaction's own single signature, with none of the routing above: this is what
+        /// <c>SignatureRole.Transaction</c> asks for, and a wallet that a transaction names as its
+        /// Sponsor or Counterparty must be able to reach it.
+        /// </summary>
+        private SignatureResult SignPlain(Dictionary<string, object> transaction)
+        {
+            if (transaction.ContainsKey("TxnSignature") || transaction.ContainsKey("Signers"))
             {
-                Dictionary<string, object> tx = transaction;
-
-                if (tx.ContainsKey("TxnSignature") || tx.ContainsKey("Signers"))
-                {
-                    throw new ValidationException("txJSON must not contain `TxnSignature` or `Signers` properties");
-                }
-
-                JsonObject txToSignAndEncode = JsonNode.Parse(JsonSerializer.Serialize(transaction, XrplJsonOptions.Default))?.AsObject();
-
-                // A present inner co-signature (SponsorSignature / CounterpartySignature)
-                // was computed over a preimage that already carried the submitter's
-                // SigningPubKey — refuse to silently invalidate it
-                if (txToSignAndEncode.ContainsKey("SponsorSignature") || txToSignAndEncode.ContainsKey("CounterpartySignature"))
-                {
-                    string existingPubKey = txToSignAndEncode["SigningPubKey"]?.GetValue<string>();
-                    if (string.IsNullOrEmpty(existingPubKey))
-                    {
-                        throw new ValidationException("The co-signature was made over a multisig submitter form (empty SigningPubKey); a single main signature would invalidate it. Sign with multisign: true instead.");
-                    }
-                    if (!string.Equals(existingPubKey, this.PublicKey, StringComparison.Ordinal))
-                    {
-                        throw new ValidationException("Transaction SigningPubKey does not match this wallet; the co-signer signed a different submitter's preimage.");
-                    }
-                }
-
-                txToSignAndEncode["SigningPubKey"] = this.PublicKey;
-
-                string signature = ComputeSignature(JsonSerializer.Deserialize<Dictionary<string, object>>(txToSignAndEncode.ToJsonString(), XrplJsonOptions.Default), this.PrivateKey);
-                txToSignAndEncode["TxnSignature"] = signature;
-
-                string serialized = XrplBinaryCodec.Encode(txToSignAndEncode);
-                return new SignatureResult(serialized, HashLedger.HashSignedTx(serialized));
+                throw new ValidationException("txJSON must not contain `TxnSignature` or `Signers` properties");
             }
+
+            JsonObject txToSignAndEncode = JsonNode.Parse(JsonSerializer.Serialize(transaction, XrplJsonOptions.Default))?.AsObject();
+
+            // A present inner co-signature (SponsorSignature / CounterpartySignature)
+            // was computed over a preimage that already carried the submitter's
+            // SigningPubKey — refuse to silently invalidate it
+            if (txToSignAndEncode.ContainsKey("SponsorSignature") || txToSignAndEncode.ContainsKey("CounterpartySignature"))
+            {
+                string existingPubKey = txToSignAndEncode["SigningPubKey"]?.GetValue<string>();
+                if (string.IsNullOrEmpty(existingPubKey))
+                {
+                    throw new ValidationException("The co-signature was made over a multisig submitter form (empty SigningPubKey); a single main signature would invalidate it. Sign with multisign: true instead.");
+                }
+                if (!string.Equals(existingPubKey, this.PublicKey, StringComparison.Ordinal))
+                {
+                    throw new ValidationException("Transaction SigningPubKey does not match this wallet; the co-signer signed a different submitter's preimage.");
+                }
+            }
+
+            txToSignAndEncode["SigningPubKey"] = this.PublicKey;
+
+            string signature = ComputeSignature(JsonSerializer.Deserialize<Dictionary<string, object>>(txToSignAndEncode.ToJsonString(), XrplJsonOptions.Default), this.PrivateKey);
+            txToSignAndEncode["TxnSignature"] = signature;
+
+            string serialized = XrplBinaryCodec.Encode(txToSignAndEncode);
+            return new SignatureResult(serialized, HashLedger.HashSignedTx(serialized));
         }
 
         private string NormalizeClassic(string? signingFor)
@@ -827,7 +833,19 @@ namespace Xrpl.Wallet
                 return HashPrefix.CounterpartyTransactionMultiSig;
             }
 
-            if (role is SignatureRole.Transaction || !coSigningSide)
+            if (role is SignatureRole.Transaction)
+            {
+                if (coSigningSide)
+                {
+                    throw new ValidationException(
+                        "The transaction carries a single main signature - SigningPubKey is set - so it has no Signers of its own, " +
+                        "and a multi-signature entry on it can only belong to the Sponsor or the Counterparty.");
+                }
+
+                return HashPrefix.TransactionMultiSig;
+            }
+
+            if (!coSigningSide)
                 return HashPrefix.TransactionMultiSig;
 
             if (hasSponsor && hasCounterparty)
@@ -1318,7 +1336,7 @@ namespace Xrpl.Wallet
             tx.Remove("TxnSignature");
 
             // The counterparty's preimage: the same transaction as the broker's, under its own prefix
-            byte[] signingBytes = LoanSigningHelper.GetSigningPreimage(tx);
+            byte[] signingBytes = LoanSigningHelper.GetCounterpartyPreimage(tx);
 
             // Sign the preimage with this wallet's key
             string sig = XrplKeypairs.Sign(signingBytes, this.PrivateKey);
@@ -1382,7 +1400,7 @@ namespace Xrpl.Wallet
             tx.Remove("SponsorSignature");
             tx.Remove("TxnSignature");
 
-            byte[] signingBytes = SponsorSigningHelper.GetSigningPreimage(tx);
+            byte[] signingBytes = SponsorSigningHelper.GetSponsorPreimage(tx);
             string sig = XrplKeypairs.Sign(signingBytes, this.PrivateKey);
 
             tx["SponsorSignature"] = SignatureObject.Single(this.PublicKey, sig).ToJsonObject();

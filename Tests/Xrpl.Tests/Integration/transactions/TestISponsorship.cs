@@ -33,14 +33,12 @@ public class TestISponsorship
     }
 
     [TestInitialize]
-    public async Task CheckSponsorAmendment()
+    public void CheckSponsorAmendment()
     {
         if (!sponsorAmendmentActive)
         {
             Assert.Inconclusive("Sponsor amendment (XLS-68) is not enabled on the test node; bump the nightly in .ci-config/Dockerfile.nightly and uncomment Sponsor in rippled.batchv11.cfg to run these tests.");
         }
-
-        await AmendmentGuard.RequireRoleSignaturesAsync(client);
         
     }
 
@@ -131,6 +129,9 @@ public class TestISponsorship
     [TestMethod]
     public async Task TestSponsoredPayment_SponsorPaysFee()
     {
+        // This one carries a SponsorSignature; the SponsorshipSet tests in this class do not
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+
         XrplWallet sponsor = XrplWallet.Generate();
         XrplWallet sponsee = XrplWallet.Generate();
         XrplWallet destination = XrplWallet.Generate();
@@ -202,6 +203,9 @@ public class TestISponsorship
     [TestMethod]
     public async Task Unified_StandardSignBothSides_V3()
     {
+        // This one carries a SponsorSignature; the SponsorshipSet tests in this class do not
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+
         var (sponsor, sponsee, destination) = await SetupSponsorshipAsync();
 
         Payment payment = await client.Autofill(SponsoredPayment(sponsee, destination, sponsor));
@@ -230,6 +234,9 @@ public class TestISponsorship
     [TestMethod]
     public async Task Unified_SmartSubmit_SponsorFinalizes()
     {
+        // This one carries a SponsorSignature; the SponsorshipSet tests in this class do not
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+
         var (sponsor, sponsee, destination) = await SetupSponsorshipAsync();
 
         Payment payment = await client.Autofill(SponsoredPayment(sponsee, destination, sponsor));
@@ -254,6 +261,9 @@ public class TestISponsorship
     [TestMethod]
     public async Task Unified_SubmitAndWaitSponsored_OneCall()
     {
+        // This one carries a SponsorSignature; the SponsorshipSet tests in this class do not
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+
         var (sponsor, sponsee, destination) = await SetupSponsorshipAsync();
 
         Payment payment = SponsoredPayment(sponsee, destination, sponsor);
@@ -268,6 +278,9 @@ public class TestISponsorship
     [TestMethod]
     public async Task Unified_SmartSubmit_RequireSign_FailsFastWithoutSponsorSignature()
     {
+        // This one carries a SponsorSignature; the SponsorshipSet tests in this class do not
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+
         var (sponsor, sponsee, destination) = await SetupSponsorshipAsync(
             SponsorshipSetFlags.tfSponsorshipSetRequireSignForFee);
 
