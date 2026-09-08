@@ -664,11 +664,14 @@ namespace Xrpl.Wallet
                 return multisign ? SignMulti(transaction, NormalizeClassic(signingFor), role) : SignAsLoanCounterparty(transaction);
 
             // The transaction's own signature. A single one is produced directly rather than
-            // through the routing overload, which would send a wallet the transaction names as
-            // its Sponsor or Counterparty to the co-signature path - the opposite of what was
-            // asked for. A multi-signature entry goes back through that overload on purpose: it
-            // carries the Batch inner-signer routing, which this overload must not skip.
-            return multisign ? Sign(transaction, true, signingFor) : SignPlain(transaction);
+            // through the routing above, which would send a wallet the transaction names as its
+            // Sponsor or Counterparty to the co-signature path - the opposite of what was asked
+            // for. A multi-signature entry keeps that routing, because a Batch inner signer needs
+            // it, and carries the role with it: delegating to the overload that has no role would
+            // hand the entry back to the inference this argument exists to override.
+            return multisign
+                ? SignRouted(transaction, true, signingFor, SignatureRole.Transaction)
+                : SignPlain(transaction);
         }
 
         /// <summary>
@@ -685,6 +688,18 @@ namespace Xrpl.Wallet
         public SignatureResult Sign(Dictionary<string, object> transaction, bool multisign = false, string? signingFor = null)
         {
             GuardMemos(transaction);
+            return SignRouted(transaction, multisign, signingFor, null);
+        }
+
+        /// <summary>
+        /// The routing every signature goes through: Batch inner signers, the sponsor and
+        /// counterparty co-signature paths, then the multi-signature or single-signature form.
+        /// </summary>
+        /// <param name="role">
+        /// The role stated by the caller, or null to work it out from the transaction.
+        /// </param>
+        private SignatureResult SignRouted(Dictionary<string, object> transaction, bool multisign, string? signingFor, SignatureRole? role)
+        {
 
             // 1) special case: Batch inner part
             if (string.Equals($"{transaction[nameof(ITransactionCommon.TransactionType)]}", "Batch", StringComparison.OrdinalIgnoreCase))
@@ -740,7 +755,7 @@ namespace Xrpl.Wallet
             {
                 // The SIGNER's address, not the owner's. Convert an X-address if one arrived.
                 var signerAccount = NormalizeClassic(signingFor);
-                return SignMulti(transaction, signerAccount);
+                return SignMulti(transaction, signerAccount, role);
             }
             return SignPlain(transaction);
         }
@@ -807,11 +822,14 @@ namespace Xrpl.Wallet
         /// It is worked out from the transaction wherever the transaction says it. A main
         /// signature that is itself multi-signed leaves <c>SigningPubKey</c> empty, so a
         /// non-empty one on a transaction naming a Sponsor or a Counterparty means the entry can
-        /// only belong to that co-signing side. When both a Sponsor and a Counterparty are named
-        /// on such a transaction, or when the main signature is multi-signed as well, the
-        /// transaction does not say, and the caller has to pass
-        /// <paramref name="role"/> through the <see cref="Sign(Dictionary{string, object}, bool, string?, SignatureRole)"/>
-        /// overload.
+        /// only belong to that co-signing side. Two shapes it cannot read, and they end
+        /// differently. Both a Sponsor and a Counterparty named on such a transaction is refused,
+        /// because either answer would be a guess. A main signature that is multi-signed as well
+        /// leaves no marker at all, so the entry is taken as the transaction's own - the common
+        /// case - and a signer on a co-signing account's list has to say so through the
+        /// <see cref="Sign(Dictionary{string, object}, bool, string?, SignatureRole)"/> overload.
+        /// Choosing wrong there is not silent: <see cref="SignatureComposer"/> verifies each
+        /// entry against the section it is routed into.
         /// </para>
         /// </remarks>
         private static HashPrefix MultiSigningPrefix(JsonObject txBase, bool coSigningSide, SignatureRole? role)

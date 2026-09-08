@@ -126,6 +126,48 @@ namespace Xrpl.Tests.Wallet.Tests
             Assert.IsTrue(XrplKeypairs.Verify(SubmitterPreimage(preimageTx), decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey));
         }
 
+        /// <summary>
+        /// A stated role reaches the prefix. It used to be dropped for a multi-signature entry:
+        /// the role-aware overload delegated to the one without a role, which then inferred the
+        /// side from the transaction and produced a sponsor entry for a caller who had asked for
+        /// the transaction's own.
+        /// </summary>
+        [TestMethod]
+        public void TestUStatedTransactionRole_IsNotSilentlyTurnedIntoASponsorEntry()
+        {
+            XrplWallet submitter = XrplWallet.Generate();
+            XrplWallet sponsor = XrplWallet.Generate();
+            XrplWallet destination = XrplWallet.Generate();
+            XrplWallet signer = XrplWallet.Generate();
+
+            JsonObject tx = BuildSponsoredPayment(submitter, sponsor, destination);
+            System.Collections.Generic.Dictionary<string, object> txDict =
+                System.Text.Json.JsonSerializer.Deserialize<System.Collections.Generic.Dictionary<string, object>>(
+                    tx.ToJsonString(), Xrpl.Client.Json.XrplJsonOptions.Default);
+
+            // The transaction carries a single main signature, so it has no Signers of its own and
+            // the ask is a contradiction. Refusing is the point: the old path answered it with a
+            // sponsor-side entry and no error.
+            ValidationException refused = Assert.ThrowsExactly<ValidationException>(
+                () => signer.Sign(txDict, true, signer.ClassicAddress, SignatureRole.Transaction));
+            StringAssert.Contains(refused.Message, "no Signers of its own");
+
+            // With the main signature multi-signed the same ask is legitimate, and the entry is
+            // signed under the transaction's own prefix rather than the sponsor's.
+            txDict["SigningPubKey"] = "";
+            SignatureResult entry = signer.Sign(txDict, true, signer.ClassicAddress, SignatureRole.Transaction);
+
+            JsonObject decoded = XrplBinaryCodec.Decode(entry.TxBlob).AsObject();
+            JsonObject forSigning = decoded.WithoutFields("TxnSignature", "Signers", "SponsorSignature");
+            byte[] preimage = global::Xrpl.AddressCodec.Utils.FromHex(
+                XrplBinaryCodec.EncodeForMultiSigning(forSigning, signer.ClassicAddress));
+            JsonObject placed = decoded["Signers"]!.AsArray()[0]!["Signer"]!.AsObject();
+
+            Assert.IsTrue(
+                XrplKeypairs.Verify(preimage, placed["TxnSignature"]!.GetValue<string>(), placed["SigningPubKey"]!.GetValue<string>()),
+                "the entry must verify under the transaction's own multisign prefix");
+        }
+
         [TestMethod]
         public void TestUSignAsSponsor_WrongSponsorAccount_Throws()
         {
