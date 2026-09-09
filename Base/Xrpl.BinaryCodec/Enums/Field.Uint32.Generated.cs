@@ -78,5 +78,11 @@ namespace Xrpl.BinaryCodec.Enums
         public static readonly Uint32Field SponsoringAccountCount = new Uint32Field(nameof(SponsoringAccountCount), 72);
         public static readonly Uint32Field RemainingOwnerCount = new Uint32Field(nameof(RemainingOwnerCount), 73);
         public static readonly Uint32Field SponsorFlags = new Uint32Field(nameof(SponsorFlags), 74);
+        public static readonly Uint32Field SubscriptionDate = new Uint32Field(nameof(SubscriptionDate), 75);
+        public static readonly Uint32Field RedemptionDate = new Uint32Field(nameof(RedemptionDate), 76);
+        public static readonly Uint32Field IssuerKeyEpoch = new Uint32Field(nameof(IssuerKeyEpoch), 77);
+        public static readonly Uint32Field AuditorKeyEpoch = new Uint32Field(nameof(AuditorKeyEpoch), 78);
+        public static readonly Uint32Field IssuerKeyMirrorEpoch = new Uint32Field(nameof(IssuerKeyMirrorEpoch), 79);
+        public static readonly Uint32Field AuditorKeyMirrorEpoch = new Uint32Field(nameof(AuditorKeyMirrorEpoch), 80);
     }
 }

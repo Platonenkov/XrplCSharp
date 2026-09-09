@@ -53,7 +53,7 @@ namespace Xrpl.Tests.Wallet.Tests
         private static string SubmitterOnlyBlob()
         {
             JsonObject tx = PreparedSponsoredTx();
-            byte[] preimage = SponsorSigningHelper.GetSigningPreimage(tx);
+            byte[] preimage = global::Xrpl.AddressCodec.Utils.FromHex(XrplBinaryCodec.EncodeForSigning(tx));
             tx["TxnSignature"] = XrplKeypairs.Sign(preimage, Submitter.PrivateKey);
             return XrplBinaryCodec.Encode(tx);
         }
@@ -164,7 +164,7 @@ namespace Xrpl.Tests.Wallet.Tests
             string sponsorPart = Sponsor.Sign(ToDict(PreparedSponsoredTx())).TxBlob;
             JsonObject other = PreparedSponsoredTx();
             other["Amount"] = "999";
-            byte[] preimage = SponsorSigningHelper.GetSigningPreimage(other);
+            byte[] preimage = global::Xrpl.AddressCodec.Utils.FromHex(XrplBinaryCodec.EncodeForSigning(other));
             other["TxnSignature"] = XrplKeypairs.Sign(preimage, Submitter.PrivateKey);
             string mismatched = XrplBinaryCodec.Encode(other);
 

@@ -8,28 +8,51 @@ using Xrpl.Keypairs;
 using Xrpl.Models.Transactions;
 using Xrpl.Utils.Hashes;
 
+// Xrpl.Utils.Hashes declares a HashPrefix of its own; the codec's is the one that prefixes a signing preimage.
+using HashPrefix = Xrpl.BinaryCodec.Hashing.HashPrefix;
+
 namespace Xrpl.Wallet
 {
     /// <summary>
     /// Shared engine behind the inner co-signature helpers. SponsorSignature
     /// (XLS-68) and CounterpartySignature (XLS-66) follow one protocol shape —
-    /// an inner not-signing STObject signed over the same preimage as the main
-    /// signature — so the V1/V2/V3 flows differ only by the field name and the
-    /// wording of their errors. SponsorSigningHelper and LoanSigningHelper are
-    /// thin facades over this class.
+    /// an inner not-signing STObject over the same transaction body as the main
+    /// signature — so the V1/V2/V3 flows differ only by the field name, the hash
+    /// prefix of the role and the wording of their errors. SponsorSigningHelper
+    /// and LoanSigningHelper are thin facades over this class.
     /// </summary>
     internal static class CoSigningEngine
     {
         /// <summary>
-        /// Computes the signing preimage bytes. The submitter and every
-        /// co-signer sign these same bytes (inner signature objects are
-        /// kNotSigning and never enter the preimage).
+        /// Computes the signing preimage bytes for the transaction's own signature.
         /// </summary>
+        /// <remarks>
+        /// Inner signature objects are kNotSigning and never enter the preimage, so the bytes
+        /// depend only on the transaction body and the prefix. Since fixCleanup3_4_0 the prefix
+        /// differs by role, so the submitter and a co-signer no longer sign the same bytes.
+        /// </remarks>
         internal static byte[] GetSigningPreimage(JsonObject txJson)
+            => GetSigningPreimage(txJson, HashPrefix.TransactionSig);
+
+        /// <summary>
+        /// Computes the signing preimage bytes under an explicit role prefix.
+        /// </summary>
+        internal static byte[] GetSigningPreimage(JsonObject txJson, HashPrefix prefix)
         {
-            string signingHex = XrplBinaryCodec.EncodeForSigning(txJson);
+            string signingHex = XrplBinaryCodec.EncodeForSigning(txJson, prefix);
             return AddressCodec.Utils.FromHex(signingHex);
         }
+
+        /// <summary>
+        /// The prefix a co-signature field is signed under, mirroring rippled's
+        /// <c>signatureRole(SField const&amp;)</c> and <c>signingPrefix</c>.
+        /// </summary>
+        internal static HashPrefix PrefixFor(string coSignatureField, bool multiSigning = false) => coSignatureField switch
+        {
+            "SponsorSignature" => multiSigning ? HashPrefix.SponsorTransactionMultiSig : HashPrefix.SponsorTransactionSig,
+            "CounterpartySignature" => multiSigning ? HashPrefix.CounterpartyTransactionMultiSig : HashPrefix.CounterpartyTransactionSig,
+            _ => throw new ValidationException($"{coSignatureField} is not a co-signature field."),
+        };
 
         /// <summary>Removes the signature-bearing fields for body comparison.</summary>
         internal static JsonObject Canonicalize(JsonObject tx, string coSignatureField) =>
@@ -50,12 +73,15 @@ namespace Xrpl.Wallet
             tx.Remove(coSignatureField);
             tx.Remove("TxnSignature");
 
-            byte[] signingBytes = GetSigningPreimage(tx);
+            // Two preimages, not one: the co-signer signs under its role prefix and the
+            // submitter under the transaction's own, and they have differed since fixCleanup3_4_0
+            byte[] coSignerBytes = GetSigningPreimage(tx, PrefixFor(coSignatureField));
+            byte[] submitterBytes = GetSigningPreimage(tx);
 
-            string coSignature = XrplKeypairs.Sign(signingBytes, coSignerWallet.PrivateKey);
+            string coSignature = XrplKeypairs.Sign(coSignerBytes, coSignerWallet.PrivateKey);
             tx[coSignatureField] = SignatureObject.Single(coSignerWallet.PublicKey, coSignature).ToJsonObject();
 
-            tx["TxnSignature"] = XrplKeypairs.Sign(signingBytes, submitterWallet.PrivateKey);
+            tx["TxnSignature"] = XrplKeypairs.Sign(submitterBytes, submitterWallet.PrivateKey);
 
             return Encode(tx);
         }

@@ -44,12 +44,15 @@ public class TestISponsorshipSigningMatrix
     }
 
     [TestInitialize]
-    public void CheckSponsorAmendment()
+    public async Task CheckSponsorAmendment()
     {
         if (!sponsorAmendmentActive)
         {
             Assert.Inconclusive("Sponsor amendment (XLS-68) is not enabled on the test node.");
         }
+
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+        
     }
 
     [ClassCleanup]
@@ -207,12 +210,15 @@ public class TestISponsorshipSigningMatrix
 
         Dictionary<string, object> prepared = await PreparedPaymentAsync(sponsee, destination, sponsor, "");
 
+        // The one shape where the transaction cannot say which signature an entry is: the main
+        // signature is multi-signed too, so an entry could belong to either side. The account's
+        // signers take the default role, the sponsor's state theirs.
         string[] parts =
         {
             accSigner1.Sign(new Dictionary<string, object>(prepared), multisign: true).TxBlob,
             accSigner2.Sign(new Dictionary<string, object>(prepared), multisign: true).TxBlob,
-            spnSigner1.Sign(new Dictionary<string, object>(prepared), multisign: true).TxBlob,
-            spnSigner2.Sign(new Dictionary<string, object>(prepared), multisign: true).TxBlob,
+            spnSigner1.Sign(new Dictionary<string, object>(prepared), true, null, SignatureRole.Sponsor).TxBlob,
+            spnSigner2.Sign(new Dictionary<string, object>(prepared), true, null, SignatureRole.Sponsor).TxBlob,
         };
 
         SignatureResult composed = await client.ComposeSignatures(parts);

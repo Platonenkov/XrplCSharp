@@ -12,6 +12,8 @@ using Xrpl.Models.Common;
 using Xrpl.Models.Ledger;
 using Xrpl.Models.Transactions;
 
+using static Xrpl.Models.Common.Common;
+
 using TxFormat = Xrpl.Models.Transaction.TxFormat;
 using Xrpl.Wallet;
 
@@ -380,6 +382,219 @@ namespace Xrpl.Tests.Models.Tests
 
             Assert.AreEqual(1u, decoded["LEVersion"]!.GetValue<uint>());
             Assert.AreEqual(6u, decoded["Scale"]!.GetValue<uint>());
+        }
+        private static readonly System.DateTime RippleEpoch = new System.DateTime(2000, 1, 1, 0, 0, 0, System.DateTimeKind.Utc);
+
+        [TestMethod]
+        public void TestUVaultCreate_ClosedEndedFields_RoundTrip()
+        {
+            // rippled #7921 (LendingProtocolV1_1): VaultKind/SubscriptionDate/RedemptionDate on VaultCreate
+            VaultCreate create = new VaultCreate
+            {
+                Account = Account1,
+                Asset = new IssuedCurrency { Currency = "XRP" },
+                VaultKind = (uint)Xrpl.Models.Ledger.VaultKind.ClosedEnded,
+                SubscriptionDate = RippleEpoch.AddSeconds(800000000),
+                RedemptionDate = RippleEpoch.AddSeconds(800086400),
+                Sequence = 1,
+                Fee = new Currency { Value = "12" },
+                SigningPublicKey = "",
+            };
+            JsonObject json = JsonNode.Parse(create.ToJson())!.AsObject();
+            Assert.AreEqual(800000000u, json["SubscriptionDate"]!.GetValue<uint>(), "dates travel as seconds since the Ripple Epoch");
+
+            string blob = XrplBinaryCodec.Encode(json);
+            JsonObject decoded = XrplBinaryCodec.Decode(blob).AsObject();
+
+            Assert.AreEqual(1u, decoded["VaultKind"]!.GetValue<uint>());
+            Assert.AreEqual(800000000u, decoded["SubscriptionDate"]!.GetValue<uint>());
+            Assert.AreEqual(800086400u, decoded["RedemptionDate"]!.GetValue<uint>());
+
+            TxFormat format = TxFormat.Formats[BinaryCodec.Types.TransactionType.VaultCreate];
+            Assert.AreEqual(TxFormat.Requirement.Optional, format[BinaryCodec.Enums.Field.VaultKind]);
+            Assert.AreEqual(TxFormat.Requirement.Optional, format[BinaryCodec.Enums.Field.SubscriptionDate]);
+            Assert.AreEqual(TxFormat.Requirement.Optional, format[BinaryCodec.Enums.Field.RedemptionDate]);
+        }
+
+        [TestMethod]
+        public async Task TestUVaultCreate_ClosedEndedPreflightRules()
+        {
+            // rippled VaultCreate::preflight rules for closed-ended vaults pinned client-side
+            Dictionary<string, object> tx = new()
+            {
+                ["TransactionType"] = "VaultCreate",
+                ["Account"] = Account1,
+                ["Asset"] = new Dictionary<string, object> { ["currency"] = "XRP" },
+            };
+            await Validation.ValidateVaultCreate(tx);
+
+            // an unknown kind is temMALFORMED
+            tx["VaultKind"] = 2u;
+            await Assert.ThrowsExactlyAsync<Xrpl.Client.Exceptions.ValidationException>(() => Validation.ValidateVaultCreate(tx));
+
+            // the dates belong to closed-ended vaults only
+            tx["VaultKind"] = (uint)Xrpl.Models.Ledger.VaultKind.OpenEnded;
+            tx["SubscriptionDate"] = 800000000u;
+            await Assert.ThrowsExactlyAsync<Xrpl.Client.Exceptions.ValidationException>(() => Validation.ValidateVaultCreate(tx));
+
+            tx.Remove("VaultKind");
+            await Assert.ThrowsExactlyAsync<Xrpl.Client.Exceptions.ValidationException>(() => Validation.ValidateVaultCreate(tx));
+
+            // a closed-ended vault needs both dates
+            tx["VaultKind"] = (uint)Xrpl.Models.Ledger.VaultKind.ClosedEnded;
+            await Assert.ThrowsExactlyAsync<Xrpl.Client.Exceptions.ValidationException>(() => Validation.ValidateVaultCreate(tx));
+
+            // kMinInvestmentPeriod (180 s since rippled #8151) <= gap < kMaxInvestmentPeriod
+            tx["RedemptionDate"] = 800000179u;
+            await Assert.ThrowsExactlyAsync<Xrpl.Client.Exceptions.ValidationException>(() => Validation.ValidateVaultCreate(tx));
+
+            tx["RedemptionDate"] = 800000180u;
+            await Validation.ValidateVaultCreate(tx);
+
+            tx["RedemptionDate"] = 800000000u + 946708560u;
+            await Assert.ThrowsExactlyAsync<Xrpl.Client.Exceptions.ValidationException>(() => Validation.ValidateVaultCreate(tx));
+
+            tx["RedemptionDate"] = 800000000u + 946708559u;
+            await Validation.ValidateVaultCreate(tx);
+        }
+
+        [TestMethod]
+        public void TestULOVault_ClosedEndedFields_Deserialize()
+        {
+            string json = JsonSerializer.Serialize(new Dictionary<string, object>
+            {
+                ["LedgerEntryType"] = "Vault",
+                ["Account"] = Account1,
+                ["Owner"] = Account2,
+                ["VaultKind"] = (uint)Xrpl.Models.Ledger.VaultKind.ClosedEnded,
+                ["SubscriptionDate"] = 800000000u,
+                ["RedemptionDate"] = 800086400u,
+            });
+            LOVault vault = JsonSerializer.Deserialize<LOVault>(json, XrplJsonOptions.Default);
+            Assert.AreEqual((uint)Xrpl.Models.Ledger.VaultKind.ClosedEnded, vault.VaultKind);
+            Assert.AreEqual(RippleEpoch.AddSeconds(800000000), vault.SubscriptionDate);
+            Assert.AreEqual(RippleEpoch.AddSeconds(800086400), vault.RedemptionDate);
+
+            // An open-ended vault carries none of the three (VaultKind is SoeDefault), exactly
+            // like every vault created before the amendment
+            string openEnded = JsonSerializer.Serialize(new Dictionary<string, object>
+            {
+                ["LedgerEntryType"] = "Vault",
+                ["Account"] = Account1,
+                ["Owner"] = Account2,
+            });
+            LOVault legacy = JsonSerializer.Deserialize<LOVault>(openEnded, XrplJsonOptions.Default);
+            Assert.IsNull(legacy.VaultKind);
+            Assert.IsNull(legacy.SubscriptionDate);
+            Assert.IsNull(legacy.RedemptionDate);
+        }
+
+        [TestMethod]
+        public void TestULOMPTokenIssuance_KeyEpochs_Deserialize()
+        {
+            // rippled #7915 (ConfidentialMPTKeyRotation): the epochs count rotations and are absent until the first one
+            string json = JsonSerializer.Serialize(new Dictionary<string, object>
+            {
+                ["LedgerEntryType"] = "MPTokenIssuance",
+                ["Issuer"] = Account1,
+                ["IssuerEncryptionKey"] = new string('C', 66),
+                ["AuditorEncryptionKey"] = new string('D', 66),
+                ["IssuerKeyEpoch"] = 2u,
+                ["AuditorKeyEpoch"] = 1u,
+            });
+            LOMPTokenIssuance issuance = JsonSerializer.Deserialize<LOMPTokenIssuance>(json, XrplJsonOptions.Default);
+            Assert.AreEqual(2u, issuance.IssuerKeyEpoch);
+            Assert.AreEqual(1u, issuance.AuditorKeyEpoch);
+
+            string neverRotated = JsonSerializer.Serialize(new Dictionary<string, object>
+            {
+                ["LedgerEntryType"] = "MPTokenIssuance",
+                ["Issuer"] = Account1,
+                ["IssuerEncryptionKey"] = new string('C', 66),
+            });
+            LOMPTokenIssuance fresh = JsonSerializer.Deserialize<LOMPTokenIssuance>(neverRotated, XrplJsonOptions.Default);
+            Assert.IsNull(fresh.IssuerKeyEpoch);
+            Assert.IsNull(fresh.AuditorKeyEpoch);
+        }
+
+        [TestMethod]
+        public void TestUDevelopFields_BinaryRoundTrip()
+        {
+            // Every field rippled develop declares at e3c8996e that 3.3.0 does not. The mirror
+            // epochs and ContractResult belong to no format yet, so nothing but the codec
+            // table knows them: this fails with an encoding error when definitions.json lacks one.
+            JsonObject json = JsonNode.Parse("""
+                {"ContractResult":7,"VaultKind":1,"SubscriptionDate":800000000,"RedemptionDate":800086400,
+                 "IssuerKeyEpoch":2,"AuditorKeyEpoch":1,"IssuerKeyMirrorEpoch":2,"AuditorKeyMirrorEpoch":1}
+                """)!.AsObject();
+            string blob = XrplBinaryCodec.Encode(json);
+            JsonObject decoded = XrplBinaryCodec.Decode(blob).AsObject();
+
+            Assert.AreEqual(7u, decoded["ContractResult"]!.GetValue<uint>());
+            Assert.AreEqual(1u, decoded["VaultKind"]!.GetValue<uint>());
+            Assert.AreEqual(800000000u, decoded["SubscriptionDate"]!.GetValue<uint>());
+            Assert.AreEqual(800086400u, decoded["RedemptionDate"]!.GetValue<uint>());
+            Assert.AreEqual(2u, decoded["IssuerKeyEpoch"]!.GetValue<uint>());
+            Assert.AreEqual(1u, decoded["AuditorKeyEpoch"]!.GetValue<uint>());
+            Assert.AreEqual(2u, decoded["IssuerKeyMirrorEpoch"]!.GetValue<uint>());
+            Assert.AreEqual(1u, decoded["AuditorKeyMirrorEpoch"]!.GetValue<uint>());
+        }
+
+        [TestMethod]
+        public void TestUWithdraws_CredentialIDs_RoundTrip()
+        {
+            // develop adds CredentialIDs to VaultWithdraw and LoanBrokerCoverWithdraw for a
+            // Destination that requires deposit authorization
+            string credential = new string('A', 64);
+            VaultWithdraw withdraw = new VaultWithdraw
+            {
+                Account = Account1,
+                VaultID = new string('E', 64),
+                Amount = new Currency { ValueAsXrp = 1m },
+                Destination = Account2,
+                CredentialIDs = new List<string> { credential },
+                Sequence = 1,
+                Fee = new Currency { Value = "12" },
+                SigningPublicKey = "",
+            };
+            JsonObject json = JsonNode.Parse(withdraw.ToJson())!.AsObject();
+            JsonObject decoded = XrplBinaryCodec.Decode(XrplBinaryCodec.Encode(json)).AsObject();
+            Assert.AreEqual(credential, decoded["CredentialIDs"]![0]!.GetValue<string>());
+
+            Assert.IsTrue(TxFormat.Formats[BinaryCodec.Types.TransactionType.VaultWithdraw]
+                .ContainsKey(BinaryCodec.Enums.Field.CredentialIDs));
+            Assert.IsTrue(TxFormat.Formats[BinaryCodec.Types.TransactionType.LoanBrokerCoverWithdraw]
+                .ContainsKey(BinaryCodec.Enums.Field.CredentialIDs));
+        }
+
+        [TestMethod]
+        public async Task TestUWithdraws_CredentialIDs_Validated()
+        {
+            Dictionary<string, object> tx = new()
+            {
+                ["TransactionType"] = "VaultWithdraw",
+                ["Account"] = Account1,
+                ["VaultID"] = new string('E', 64),
+                ["Amount"] = "1000000",
+                ["CredentialIDs"] = new List<object> { "not-a-hash" },
+            };
+            await Assert.ThrowsExactlyAsync<Xrpl.Client.Exceptions.ValidationException>(() => Validation.ValidateVaultWithdraw(tx));
+
+            tx["CredentialIDs"] = new List<object> { new string('A', 64) };
+            await Validation.ValidateVaultWithdraw(tx);
+
+            Dictionary<string, object> cover = new()
+            {
+                ["TransactionType"] = "LoanBrokerCoverWithdraw",
+                ["Account"] = Account1,
+                ["LoanBrokerID"] = new string('E', 64),
+                ["Amount"] = "1000000",
+                ["CredentialIDs"] = new List<object> { "not-a-hash" },
+            };
+            await Assert.ThrowsExactlyAsync<Xrpl.Client.Exceptions.ValidationException>(() => Validation.ValidateLoanBrokerCoverWithdraw(cover));
+
+            cover["CredentialIDs"] = new List<object> { new string('A', 64) };
+            await Validation.ValidateLoanBrokerCoverWithdraw(cover);
         }
     }
 }

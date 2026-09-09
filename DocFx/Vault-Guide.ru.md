@@ -57,6 +57,33 @@ Vault — это ledger-структура, которая хранит один
 Определяет правила вывода:
 - `0x0001` (`vaultStrategyFirstComeFirstServe`) — вкладчики могут выкупить любое количество активов при наличии достаточного числа долей
 
+### Вид vault (LendingProtocolV1_1)
+
+По умолчанию vault открытый (open-ended): внесение и вывод возможны в любой момент. С поправкой LendingProtocolV1_1 vault можно создать закрытым (closed-ended), с тремя фазами, зафиксированными при создании:
+
+| Фаза | Заканчивается | Внесение | Вывод |
+|------|---------------|----------|-------|
+| Subscription | `SubscriptionDate` (включительно) | разрешено | разрешён |
+| Investment | `RedemptionDate` | отклоняется (`tecEXPIRED`) | отклоняется (`tecTOO_SOON`) |
+| Redemption | никогда | отклоняется (`tecEXPIRED`) | разрешён |
+
+`VaultKind`, `SubscriptionDate` и `RedemptionDate` задаются в `VaultCreate` и позже не меняются. Закрытому vault нужны обе даты, причём redemption не раньше чем через три минуты и строго раньше чем через тридцать лет после subscription; открытый vault не может нести ни одной. В моделях даты представлены как `DateTime?`, по сети передаются секундами от Ripple Epoch.
+
+```csharp
+using Xrpl.Models.Ledger;   // VaultKind
+
+VaultCreate vaultTx = new VaultCreate
+{
+    Account = wallet.ClassicAddress,
+    Asset = new IssuedCurrency { Currency = "XRP" },
+    VaultKind = (uint)VaultKind.ClosedEnded,
+    SubscriptionDate = DateTime.UtcNow.AddDays(7),
+    RedemptionDate = DateTime.UtcNow.AddDays(97),
+};
+```
+
+Узел без поправки отклоняет `VaultCreate` с любым из трёх полей (`temDISABLED`). В ledger-объекте `VaultKind` отсутствует у открытого vault независимо от того, создан он до поправки или после.
+
 ### Флаги Vault
 
 Устанавливаются только при создании через `VaultCreate`:
@@ -292,6 +319,10 @@ Console.WriteLine($"Metadata: {vault.DataParsed?.Name}");
 | `ShareMPTID` | string | ID MPTokenIssuance для долей |
 | `WithdrawalPolicy` | uint? | Стратегия вывода |
 | `Scale` | uint? | Точность при расчёте долей |
+| `LEVersion` | uint? | Версия схемы (`VaultVersion`), отсутствует у vault, созданных до cash-basis учёта |
+| `VaultKind` | uint? | `VaultKind.ClosedEnded` (1) для закрытого vault, иначе отсутствует |
+| `SubscriptionDate` | DateTime? | Конец фазы subscription (только closed-ended) |
+| `RedemptionDate` | DateTime? | Начало фазы redemption (только closed-ended) |
 | `Data` | string | Hex-метаданные (макс. 256 байт) |
 | `Sequence` | uint? | Sequence транзакции создания |
 

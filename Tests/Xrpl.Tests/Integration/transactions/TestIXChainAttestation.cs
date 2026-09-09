@@ -74,6 +74,8 @@ public class TestIXChainAttestation : TestIXChainBridgeBase
             Assert.Inconclusive("Sponsor amendment (XLS-68) is not enabled on the test node.");
         }
 
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+
         await SubmitAsync(new SponsorshipSet
         {
             Account = sponsor.ClassicAddress,

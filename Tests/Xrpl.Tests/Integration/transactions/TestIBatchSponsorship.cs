@@ -44,12 +44,14 @@ public class TestIBatchSponsorship
     }
 
     [TestInitialize]
-    public void CheckSponsorAmendment()
+    public async Task CheckSponsorAmendment()
     {
         if (!sponsorAmendmentActive)
         {
             Assert.Inconclusive("Sponsor amendment (XLS-68) is not enabled on the test node.");
         }
+
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
     }
 
     [ClassCleanup]

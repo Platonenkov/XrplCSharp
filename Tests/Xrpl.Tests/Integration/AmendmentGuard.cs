@@ -2,6 +2,8 @@ using System;
 using System.Text.Json.Nodes;
 using System.Threading.Tasks;
 
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+
 using Xrpl.Client;
 using Xrpl.Client.Exceptions;
 using Xrpl.Models.Methods;
@@ -54,8 +56,43 @@ public static class AmendmentGuard
     /// </summary>
     public const string MPTokensV2 = "BE2D87DF21B690ED1497B593FDC013CC04276302380B1BD50A033DCF8DEFB2EB";
 
+    /// <summary>
+    /// Amendment id of fixCleanup3_4_0 (sha512half of the name): each signing role gets its own
+    /// hash prefix, so a SponsorSignature or a CounterpartySignature covers different bytes than
+    /// the transaction's own signature.
+    /// </summary>
+    public const string FixCleanup340 = "98433DD001A5737F773D74F8CA2A25A065089C73B2E611C760BAF369E4FECA76";
+
+    /// <summary>Amendment id of LendingProtocolV1_1 (sha512half of the name): closed-ended vaults.</summary>
+    public const string LendingProtocolV11 = "A360E2BFD775A5B0DCE1C36C16DF31B72735A57584FD163655D2F9564F8E7AC8";
+
     /// <summary>Amendment id of XChainBridge / XLS-38 (sha512half of the name).</summary>
     public const string XChainBridge = "C98D98EE9616ACD36E81FDEB8D41D349BF5F1B41DD64A0ABC1FE9AA5EA267E9C";
+
+    private static bool? roleSignatures;
+
+    /// <summary>
+    /// Skips the test when the node still verifies role signatures the pre-fixCleanup3_4_0 way.
+    /// </summary>
+    /// <remarks>
+    /// The SDK signs a SponsorSignature and a CounterpartySignature under the role prefixes the
+    /// amendment introduced, and does not carry the older scheme: no public network can use either
+    /// field without the amendment, since Sponsor and LendingProtocol are enabled nowhere it is
+    /// absent. The CI stand is the one place both are true at once - it runs a release build older
+    /// than the amendment with both features voted in at genesis - so these tests belong to the
+    /// nightly stand until that release moves on.
+    /// </remarks>
+    public static async Task RequireRoleSignaturesAsync(IXrplClient client)
+    {
+        // Only a yes is remembered. IsEnabledAsync answers false both for "the node does not have
+        // it" and for "the node refused the question", and caching the second would turn one
+        // transient error into a whole run reported as skipped.
+        if (roleSignatures != true)
+            roleSignatures = await IsEnabledAsync(client, FixCleanup340);
+
+        if (roleSignatures != true)
+            Assert.Inconclusive("The node verifies a role signature the pre-fixCleanup3_4_0 way, over the transaction's own prefix; the SDK signs under the role prefix the amendment introduced. Run these on a stand carrying fixCleanup3_4_0 (.ci-config/docker-compose.batchv11.yml) or on devnet.");
+    }
 
     public static async Task<bool> IsEnabledAsync(IXrplClient client, string amendmentId)
     {

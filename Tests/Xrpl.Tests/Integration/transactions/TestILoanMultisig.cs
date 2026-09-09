@@ -47,6 +47,9 @@ public class TestILoanMultisig : TestILoanBase
     /// </summary>
     private static async Task<MultisigLoan> SetupAsync()
     {
+        // The borrower's entries land in CounterpartySignature.Signers, a role signature
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+
         XrplWallet broker = XrplWallet.Generate();
         XrplWallet borrower = XrplWallet.Generate();
         XrplWallet signer1 = XrplWallet.Generate();

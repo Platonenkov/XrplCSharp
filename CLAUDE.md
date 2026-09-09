@@ -168,7 +168,7 @@ Some amendments (e.g. `BatchV1_1`, `PermissionDelegationV1_1`) exist only on the
 docker compose -f .ci-config/docker-compose.ci.yml down
 
 docker compose -f .ci-config/docker-compose.batchv11.yml up -d --build
-dotnet test Tests/Xrpl.Tests/Xrpl.Tests.csproj --settings test.runsettings --filter "TestIBatch|TestIDelegateSet"
+dotnet test Tests/Xrpl.Tests/Xrpl.Tests.csproj --settings test.runsettings --filter "TestIBatch|TestIDelegateSet|TestIClosedEndedVault"
 docker compose -f .ci-config/docker-compose.batchv11.yml down
 ```
 

@@ -25,6 +25,7 @@ namespace XrplTests.Xrpl.Wallet
         private static readonly XrplWallet Signer1 = XrplWallet.Generate();
         private static readonly XrplWallet Signer2 = XrplWallet.Generate("secp256k1");
         private static readonly XrplWallet Stranger = XrplWallet.Generate();
+        private static readonly XrplWallet Sponsor = XrplWallet.Generate();
 
         private const string BrokerId = "1111111111111111111111111111111111111111111111111111111111111111";
 
@@ -73,7 +74,8 @@ namespace XrplTests.Xrpl.Wallet
             {
                 JsonObject signer = entry["Signer"].AsObject();
                 string account = signer["Account"].GetValue<string>();
-                byte[] preimage = global::Xrpl.AddressCodec.Utils.FromHex(XrplBinaryCodec.EncodeForMultiSigning(forSigning, account));
+                byte[] preimage = global::Xrpl.AddressCodec.Utils.FromHex(XrplBinaryCodec.EncodeForMultiSigning(
+                    forSigning, account, global::Xrpl.BinaryCodec.Hashing.HashPrefix.CounterpartyTransactionMultiSig));
                 Assert.IsTrue(
                     XrplKeypairs.Verify(preimage, signer["TxnSignature"].GetValue<string>(), signer["SigningPubKey"].GetValue<string>()),
                     $"the entry of {account} must verify over the multisign preimage");
@@ -91,9 +93,12 @@ namespace XrplTests.Xrpl.Wallet
         public void TestUCompose_UnlistedSigner_StaysOnTheBrokerSide()
         {
             Dictionary<string, object> prepared = Prepared();
+            // The broker signs multisig too, so the transaction cannot say which side an entry
+            // belongs to and each signer states it: the borrower's signer names the counterparty
+            // role, the broker's takes the default.
             prepared["SigningPubKey"] = "";
             SignatureResult brokerSigner = Stranger.Sign(new Dictionary<string, object>(prepared), multisign: true);
-            SignatureResult borrowerSigner = Signer1.Sign(new Dictionary<string, object>(prepared), multisign: true);
+            SignatureResult borrowerSigner = Signer1.Sign(new Dictionary<string, object>(prepared), true, null, SignatureRole.Counterparty);
 
             SignatureResult composed = SignatureComposer.ComposeSignatures(
                 new[] { brokerSigner.TxBlob, borrowerSigner.TxBlob },
@@ -130,8 +135,11 @@ namespace XrplTests.Xrpl.Wallet
         public void TestUCompose_TwoArgumentOverload_RoutesSponsorSideOnly()
         {
             Dictionary<string, object> prepared = Prepared();
+            // A sponsor to route to, and a main signature that is multi-signed as well, so the
+            // sponsor's signer has to name its role.
+            prepared["Sponsor"] = Sponsor.ClassicAddress;
             prepared["SigningPubKey"] = "";
-            SignatureResult sponsorSigner = Signer1.Sign(new Dictionary<string, object>(prepared), multisign: true);
+            SignatureResult sponsorSigner = Signer1.Sign(new Dictionary<string, object>(prepared), true, null, SignatureRole.Sponsor);
             SignatureResult otherSigner = Stranger.Sign(new Dictionary<string, object>(prepared), multisign: true);
 
             SignatureResult composed = SignatureComposer.ComposeSignatures(

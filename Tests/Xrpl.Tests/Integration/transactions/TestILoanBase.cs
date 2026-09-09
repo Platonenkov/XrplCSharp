@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -11,6 +12,7 @@ using Xrpl.Client.Exceptions;
 using Xrpl.Client.Json;
 using Xrpl.Models;
 using Xrpl.Models.Common;
+using Xrpl.Models.Ledger;
 using Xrpl.Models.Methods;
 using Xrpl.Models.Transactions;
 using Xrpl.Sugar;
@@ -68,17 +70,118 @@ public abstract class TestILoanBase
         return null;
     }
 
+    #region Closed-ended vaults (LendingProtocolV1_1)
+
+    /// <summary>
+    /// How much subscription phase to buy, counted from the close time read while the VaultCreate
+    /// is still being built. It has to cover that read, the create, and the deposit that follows:
+    /// rippled accepts a vault deposit in the subscription phase only - <c>tecEXPIRED</c>
+    /// afterwards - and each of the two transactions waits for a ledger of its own.
+    /// </summary>
+    private const int SubscriptionWindowSeconds = 30;
+
+    /// <summary>
+    /// Length of the investment phase, where a loan can be originated.
+    /// </summary>
+    /// <remarks>
+    /// LoanSet refuses a loan whose final payment falls within <c>kLoanRedemptionBuffer</c> (60 s)
+    /// of the vault's redemption date, and rippled's default schedule is one payment 60 s out, so
+    /// the loan alone asks for 120 s of room. The window is wider so a test can spend time between
+    /// the broker and the loan, and it stays far below the 30-year ceiling on the phase.
+    /// </remarks>
+    private const int InvestmentWindowSeconds = 900;
+
+    private static bool? closedEndedRequired;
+
+    /// <summary>
+    /// Whether a LoanBroker on this node requires a closed-ended vault. Since LendingProtocolV1_1
+    /// <c>LoanBrokerSet::preclaim</c> refuses an open-ended one with <c>tecNO_PERMISSION</c>,
+    /// because the lending protocol is written around the subscription / investment / redemption
+    /// phases. A node without the amendment does not know the fields at all and answers
+    /// <c>invalidTransaction</c> to a transaction carrying them, so the open-ended path has to stay.
+    /// </summary>
+    protected static async Task<bool> ClosedEndedVaultRequiredAsync(IXrplClient client)
+    {
+        // Only a yes is remembered: a node that refused the question answers the same false as a
+        // node without the amendment, and caching that would send every later broker to the
+        // open-ended path the amendment refuses, one transient error turning into a red suite.
+        if (closedEndedRequired != true)
+            closedEndedRequired = await AmendmentGuard.IsEnabledAsync(client, AmendmentGuard.LendingProtocolV11);
+
+        return closedEndedRequired.Value;
+    }
+
+    /// <summary>
+    /// Builds the VaultCreate a LoanBroker can be attached to on this node, with the phase dates
+    /// measured from the ledger clock rather than the machine's.
+    /// </summary>
+    protected static async Task<VaultCreate> BuildBrokerVaultAsync(
+        IXrplClient client,
+        string owner,
+        IssuedCurrency asset)
+    {
+        VaultCreate tx = new VaultCreate
+        {
+            Account = owner,
+            Asset = asset,
+        };
+
+        if (!await ClosedEndedVaultRequiredAsync(client))
+            return tx;
+
+        DateTime subscriptionDate = (await IntegrationTestConfig.ValidatedCloseTimeAsync(client))
+            .AddSeconds(SubscriptionWindowSeconds);
+
+        tx.VaultKind = (uint)VaultKind.ClosedEnded;
+        tx.SubscriptionDate = subscriptionDate;
+        tx.RedemptionDate = subscriptionDate.AddSeconds(InvestmentWindowSeconds);
+        return tx;
+    }
+
+    /// <summary>
+    /// Waits until the vault has left the subscription phase, which is where LoanSet needs it
+    /// (<c>tecTOO_SOON</c> before, <c>tecEXPIRED</c> once redemption starts). A vault carrying no
+    /// SubscriptionDate is open-ended and has no phases at all: there is nothing to wait for.
+    /// </summary>
+    protected static async Task EnterInvestmentPhaseAsync(IXrplClient client, string vaultId)
+    {
+        LedgerEntryResponse entry = await client.LedgerEntry(new LedgerEntryRequest { Index = vaultId }).Typed();
+        if (entry?.Node is not LOVault vault)
+            throw new RippleException($"ledger_entry for vault {vaultId} did not come back as a Vault: {entry?.Node?.GetType().Name ?? "nothing"}");
+
+        // No SubscriptionDate is an open-ended vault, which has no phases to wait for
+        if (vault.SubscriptionDate is not DateTime subscriptionDate)
+            return;
+
+        await IntegrationTestConfig.WaitForCloseTimeAsync(client, subscriptionDate, nodeType);
+
+        // Past the start of the phase is not the same as inside it. Landing past the redemption
+        // date instead would make the LoanSet that follows fail with tecEXPIRED, which reads as a
+        // protocol refusal rather than as this wait having missed its window.
+        if (vault.RedemptionDate is DateTime redemptionDate)
+        {
+            DateTime now = await IntegrationTestConfig.ValidatedCloseTimeAsync(client);
+            if (now >= redemptionDate)
+            {
+                throw new RippleException(
+                    $"vault {vaultId} reached its redemption phase before a loan could be originated: " +
+                    $"close time {now:O}, redemption {redemptionDate:O}. The investment window was too short for this run.");
+            }
+        }
+    }
+
+    #endregion
+
     /// <summary>
     /// Creates a Vault for the given wallet and returns its VaultID from metadata.
     /// LoanBrokerSet requires an existing Vault owned by the submitting account.
     /// </summary>
     protected static async Task<string> CreateVaultForBroker(IXrplClient client, XrplWallet wallet)
     {
-        VaultCreate vaultTx = new VaultCreate
-        {
-            Account = wallet.ClassicAddress,
-            Asset = new IssuedCurrency { Currency = "XRP" },
-        };
+        VaultCreate vaultTx = await BuildBrokerVaultAsync(
+            client,
+            wallet.ClassicAddress,
+            new IssuedCurrency { Currency = "XRP" });
         vaultTx = await client.Autofill(vaultTx);
         TransactionSummary vaultResult = await client.SubmitAndWait(vaultTx, wallet, true);
         ValidateResult(vaultResult);
@@ -134,6 +237,10 @@ public abstract class TestILoanBase
         TransactionSummary coverResult = await client.SubmitAndWait(coverTx, wallet, true);
         ValidateResult(coverResult);
 
+        // The caller's next move is usually a LoanSet, which rippled only originates in the
+        // investment phase; the deposit above had to happen before it, in the subscription phase.
+        await EnterInvestmentPhaseAsync(client, vaultId);
+
         return brokerId;
     }
 
@@ -147,6 +254,9 @@ public abstract class TestILoanBase
         LoanSet loanTx,
         XrplWallet brokerWallet)
     {
+        // A LoanSet always carries a CounterpartySignature, which is a role signature
+        await AmendmentGuard.RequireRoleSignaturesAsync(client);
+
         loanTx = await client.Autofill(loanTx);
         return LoanSigningHelper.PrepareForSigning(loanTx, brokerWallet);
     }
@@ -318,11 +428,10 @@ public abstract class TestILoanBase
         ValidateResult(payResult);
 
         // 5. Create MPT-backed vault
-        VaultCreate vaultCreateTx = new VaultCreate
-        {
-            Account = issuerWallet.ClassicAddress,
-            Asset = new IssuedCurrency { MptIssuanceId = issuanceId },
-        };
+        VaultCreate vaultCreateTx = await BuildBrokerVaultAsync(
+            client,
+            issuerWallet.ClassicAddress,
+            new IssuedCurrency { MptIssuanceId = issuanceId });
         vaultCreateTx = await client.Autofill(vaultCreateTx);
         TransactionSummary vaultCreateResult = await client.SubmitAndWait(vaultCreateTx, issuerWallet, true);
         ValidateResult(vaultCreateResult);
@@ -372,6 +481,8 @@ public abstract class TestILoanBase
         coverTx = await client.Autofill(coverTx);
         TransactionSummary coverResult = await client.SubmitAndWait(coverTx, issuerWallet, true);
         ValidateResult(coverResult);
+
+        await EnterInvestmentPhaseAsync(client, vaultId);
 
         return (brokerId, issuanceId);
     }

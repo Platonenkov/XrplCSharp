@@ -33,6 +33,13 @@ namespace Xrpl.Tests.Wallet.Tests
             ["SponsorFlags"] = SpfSponsorFee | SpfSponsorReserve,
         };
 
+        /// <summary>
+        /// What the submitter's own TxnSignature covers. Since fixCleanup3_4_0 that is no longer
+        /// what the sponsor signs: the two preimages differ in their four-byte prefix.
+        /// </summary>
+        private static byte[] SubmitterPreimage(JsonObject tx) =>
+            global::Xrpl.AddressCodec.Utils.FromHex(XrplBinaryCodec.EncodeForSigning(tx));
+
         [TestMethod]
         public void TestUSignSponsored_V1_BothSignaturesVerify()
         {
@@ -54,12 +61,12 @@ namespace Xrpl.Tests.Wallet.Tests
             JsonObject preimageTx = decoded.DeepClone().AsObject();
             preimageTx.Remove("SponsorSignature");
             preimageTx.Remove("TxnSignature");
-            byte[] preimage = SponsorSigningHelper.GetSigningPreimage(preimageTx);
+            byte[] preimage = SponsorSigningHelper.GetSponsorPreimage(preimageTx);
 
             Assert.IsTrue(XrplKeypairs.Verify(preimage, sponsorSig["TxnSignature"]!.GetValue<string>(), sponsor.PublicKey),
-                "SponsorSignature must verify over the transaction preimage.");
-            Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey),
-                "Submitter TxnSignature must verify over the same preimage.");
+                "SponsorSignature must verify over the sponsor preimage.");
+            Assert.IsTrue(XrplKeypairs.Verify(SubmitterPreimage(preimageTx), decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey),
+                "Submitter TxnSignature must verify over the transaction preimage.");
         }
 
         [TestMethod]
@@ -86,12 +93,12 @@ namespace Xrpl.Tests.Wallet.Tests
             JsonObject preimageTx = decoded.DeepClone().AsObject();
             preimageTx.Remove("SponsorSignature");
             preimageTx.Remove("TxnSignature");
-            byte[] preimage = SponsorSigningHelper.GetSigningPreimage(preimageTx);
+            byte[] preimage = SponsorSigningHelper.GetSponsorPreimage(preimageTx);
 
             Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["SponsorSignature"]!["TxnSignature"]!.GetValue<string>(), sponsor.PublicKey),
-                "Combined SponsorSignature must verify over the shared preimage.");
-            Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey),
-                "Combined TxnSignature must verify over the shared preimage.");
+                "Combined SponsorSignature must verify over the sponsor preimage.");
+            Assert.IsTrue(XrplKeypairs.Verify(SubmitterPreimage(preimageTx), decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey),
+                "Combined TxnSignature must verify over the transaction preimage.");
         }
 
         [TestMethod]
@@ -113,10 +120,52 @@ namespace Xrpl.Tests.Wallet.Tests
             JsonObject preimageTx = decoded.DeepClone().AsObject();
             preimageTx.Remove("SponsorSignature");
             preimageTx.Remove("TxnSignature");
-            byte[] preimage = SponsorSigningHelper.GetSigningPreimage(preimageTx);
+            byte[] preimage = SponsorSigningHelper.GetSponsorPreimage(preimageTx);
 
             Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["SponsorSignature"]!["TxnSignature"]!.GetValue<string>(), sponsor.PublicKey));
-            Assert.IsTrue(XrplKeypairs.Verify(preimage, decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey));
+            Assert.IsTrue(XrplKeypairs.Verify(SubmitterPreimage(preimageTx), decoded["TxnSignature"]!.GetValue<string>(), submitter.PublicKey));
+        }
+
+        /// <summary>
+        /// A stated role reaches the prefix. It used to be dropped for a multi-signature entry:
+        /// the role-aware overload delegated to the one without a role, which then inferred the
+        /// side from the transaction and produced a sponsor entry for a caller who had asked for
+        /// the transaction's own.
+        /// </summary>
+        [TestMethod]
+        public void TestUStatedTransactionRole_IsNotSilentlyTurnedIntoASponsorEntry()
+        {
+            XrplWallet submitter = XrplWallet.Generate();
+            XrplWallet sponsor = XrplWallet.Generate();
+            XrplWallet destination = XrplWallet.Generate();
+            XrplWallet signer = XrplWallet.Generate();
+
+            JsonObject tx = BuildSponsoredPayment(submitter, sponsor, destination);
+            System.Collections.Generic.Dictionary<string, object> txDict =
+                System.Text.Json.JsonSerializer.Deserialize<System.Collections.Generic.Dictionary<string, object>>(
+                    tx.ToJsonString(), Xrpl.Client.Json.XrplJsonOptions.Default);
+
+            // The transaction carries a single main signature, so it has no Signers of its own and
+            // the ask is a contradiction. Refusing is the point: the old path answered it with a
+            // sponsor-side entry and no error.
+            ValidationException refused = Assert.ThrowsExactly<ValidationException>(
+                () => signer.Sign(txDict, true, signer.ClassicAddress, SignatureRole.Transaction));
+            StringAssert.Contains(refused.Message, "no Signers of its own");
+
+            // With the main signature multi-signed the same ask is legitimate, and the entry is
+            // signed under the transaction's own prefix rather than the sponsor's.
+            txDict["SigningPubKey"] = "";
+            SignatureResult entry = signer.Sign(txDict, true, signer.ClassicAddress, SignatureRole.Transaction);
+
+            JsonObject decoded = XrplBinaryCodec.Decode(entry.TxBlob).AsObject();
+            JsonObject forSigning = decoded.WithoutFields("TxnSignature", "Signers", "SponsorSignature");
+            byte[] preimage = global::Xrpl.AddressCodec.Utils.FromHex(
+                XrplBinaryCodec.EncodeForMultiSigning(forSigning, signer.ClassicAddress));
+            JsonObject placed = decoded["Signers"]!.AsArray()[0]!["Signer"]!.AsObject();
+
+            Assert.IsTrue(
+                XrplKeypairs.Verify(preimage, placed["TxnSignature"]!.GetValue<string>(), placed["SigningPubKey"]!.GetValue<string>()),
+                "the entry must verify under the transaction's own multisign prefix");
         }
 
         [TestMethod]
@@ -152,8 +201,8 @@ namespace Xrpl.Tests.Wallet.Tests
             withoutSig.Remove("SponsorSignature");
 
             CollectionAssert.AreEqual(
-                SponsorSigningHelper.GetSigningPreimage(withoutSig),
-                SponsorSigningHelper.GetSigningPreimage(withSig),
+                SponsorSigningHelper.GetSponsorPreimage(withoutSig),
+                SponsorSigningHelper.GetSponsorPreimage(withSig),
                 "SponsorSignature must not affect the signing preimage (kNotSigning).");
 
             // ...but must round-trip through the binary encoding

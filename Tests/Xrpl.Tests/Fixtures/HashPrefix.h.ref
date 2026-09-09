@@ -1,0 +1,22 @@
+https://github.com/XRPLF/rippled/blob/develop/include/xrpl/protocol/HashPrefix.h
+sha  e3c8996e44921fe3b4e02c65cb41948848bcc7c5
+date 2026-09-05T00:06:14Z
+
+HashPrefix.h is vendored byte-identical to the ref above so that it can be
+re-verified with a plain diff:
+
+  curl -sSL https://raw.githubusercontent.com/XRPLF/rippled/e3c8996e44921fe3b4e02c65cb41948848bcc7c5/include/xrpl/protocol/HashPrefix.h \
+    | diff - Tests/Xrpl.Tests/Fixtures/HashPrefix.h
+
+This is where the protocol states the four bytes that go in front of a signing
+preimage. A wrong value there is invisible to every local test: the SDK signs and
+verifies with the same constant, agrees with itself, and only a node refuses the
+signature. Reading the values out of this file is what makes
+TestURoleSigningPrefixes a check rather than a restatement.
+
+Pinned to a develop commit rather than to a release tag, like ledger_entries.macro
+and transactions.macro: the role prefixes exist only after fixCleanup3_4_0, and a
+3.3.0 tag would report them as values the SDK invented.
+
+Do not hand-edit it. When protocol-watch reports a change to this file upstream,
+replace it wholesale and update the sha above.

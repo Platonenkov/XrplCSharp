@@ -192,6 +192,21 @@ namespace Xrpl.Models.Ledger
         public string? AuditorEncryptionKey { get; init; }
 
         /// <summary>
+        /// ConfidentialMPTKeyRotation: how many times <see cref="IssuerEncryptionKey"/> has been replaced
+        /// through MPTokenIssuanceSet. Absent (0) until the first rotation, including on issuances whose
+        /// key was registered before the amendment.
+        /// </summary>
+        [JsonPropertyName("IssuerKeyEpoch")]
+        public uint? IssuerKeyEpoch { get; init; }
+
+        /// <summary>
+        /// ConfidentialMPTKeyRotation: how many times <see cref="AuditorEncryptionKey"/> has been replaced
+        /// through MPTokenIssuanceSet. Absent (0) until the first rotation.
+        /// </summary>
+        [JsonPropertyName("AuditorKeyEpoch")]
+        public uint? AuditorKeyEpoch { get; init; }
+
+        /// <summary>
         /// ConfidentialTransfer: total amount held in confidential balances.
         /// UInt64 (0 .. 2^63-1)
         /// </summary>

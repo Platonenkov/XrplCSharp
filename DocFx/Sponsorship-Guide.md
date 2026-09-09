@@ -46,7 +46,7 @@ Two independent dimensions can be sponsored:
 | Fees | `SponsorCoverage.spfSponsorFee` (= 1) | The `Fee` of the sponsee's transactions |
 | Reserves | `SponsorCoverage.spfSponsorReserve` (= 2) | Reserves on behalf of the sponsee: owner reserves of objects it creates **and** account reserves (including sponsored account creation) |
 
-Every transaction type gains three common fields: `Sponsor`, `SponsorFlags`, and (when the sponsorship demands a co-signature) `SponsorSignature` — an inner not-signing STObject over the **same preimage** as the main signature. It comes in two alternative forms: single-signature (`SigningPubKey` + `TxnSignature`) or sponsor multisig (a nested `Signers` array).
+Every transaction type gains three common fields: `Sponsor`, `SponsorFlags`, and (when the sponsorship demands a co-signature) `SponsorSignature` — an inner not-signing STObject over the **same transaction as the main signature, under the sponsor's own hash prefix** (rippled `fixCleanup3_4_0`; before it every role signed identical bytes). It comes in two alternative forms: single-signature (`SigningPubKey` + `TxnSignature`) or sponsor multisig (a nested `Signers` array).
 
 ---
 
@@ -177,7 +177,7 @@ If the sponsorship does **not** require a co-signature, sign and submit as usual
 
 ## Signing Flows (V1/V2/V3)
 
-`SponsorSignature` is signed over the same preimage as the main signature (analogous to the LoanSet counterparty pattern).
+`SponsorSignature` covers the same transaction as the main signature but under the sponsor's own hash prefix, which `fixCleanup3_4_0` introduced (analogous to the LoanSet counterparty pattern). The SDK picks the prefix from the role; nothing to pass.
 
 ### The simple path — standard Sign/Submit (10.8.0+)
 

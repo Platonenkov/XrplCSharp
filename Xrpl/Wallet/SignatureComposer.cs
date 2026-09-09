@@ -5,9 +5,13 @@ using System.Linq;
 using System.Text.Json.Nodes;
 
 using Xrpl.BinaryCodec;
+using Xrpl.Keypairs;
 using Xrpl.Client.Exceptions;
 using Xrpl.Models.Transactions;
 using Xrpl.Utils.Hashes;
+
+// Xrpl.Utils.Hashes declares a HashPrefix of its own; the codec's is the one that prefixes a signing preimage.
+using HashPrefix = Xrpl.BinaryCodec.Hashing.HashPrefix;
 
 namespace Xrpl.Wallet
 {
@@ -16,10 +20,13 @@ namespace Xrpl.Wallet
     /// Devices sign with whatever keys they hold — single main signature,
     /// sponsor or counterparty co-signature, or portable multisig Signer
     /// entries — and the composer routes everything into the right sections.
-    /// Signer entries are section-agnostic by protocol (identical preimage for
-    /// tx.Signers, SponsorSignature.Signers and CounterpartySignature.Signers,
-    /// see rippled STTx::checkMultiSign), so only the composer needs to know
-    /// which signer belongs to which side.
+    /// Which section an entry belongs to is still decided here, by account, but it is no longer
+    /// only the composer's business: since rippled's fixCleanup3_4_0 an entry in
+    /// SponsorSignature.Signers or CounterpartySignature.Signers covers different bytes than one
+    /// in tx.Signers, so the signer had to know its side already. It works that out from the
+    /// transaction in every shape but one - see <see cref="SignatureRole"/> - and routing an entry
+    /// into a section its signer did not sign for now produces a signature the node rejects
+    /// rather than a portable one.
     /// </summary>
     public static class SignatureComposer
     {
@@ -193,8 +200,88 @@ namespace Xrpl.Wallet
                 }
             }
 
+            VerifyEverySignature(result, sections);
+
             string txBlob = XrplBinaryCodec.Encode(result);
             return new SignatureResult(txBlob, HashLedger.HashSignedTx(txBlob));
+        }
+
+        /// <summary>
+        /// Checks every signature in the composed transaction against the bytes that transaction
+        /// actually ships, under the prefix of the section it ended up in.
+        /// </summary>
+        /// <remarks>
+        /// Routing by account is a guess about what a signer meant, and since rippled's
+        /// fixCleanup3_4_0 a wrong guess is no longer harmless: an entry made for the transaction
+        /// itself covers different bytes than one made for a co-signing account, and only the node
+        /// used to notice. Where the transaction cannot say which side a multi-signature entry
+        /// belongs to - the main signature multi-signed as well - the signer chooses a default,
+        /// and this is where choosing wrong stops being silent. It catches the other direction
+        /// too: a part signed over a SigningPubKey the composed transaction does not ship.
+        /// <para>
+        /// The preimage is taken from <paramref name="result"/> itself. TxnSignature, Signers and
+        /// both co-signature objects are not signing fields, so the codec drops them and what is
+        /// left is exactly what each participant signed.
+        /// </para>
+        /// </remarks>
+        private static void VerifyEverySignature(JsonObject result, IEnumerable<InnerSection> sections)
+        {
+            if (result["TxnSignature"]?.GetValue<string>() is { Length: > 0 } mainSignature)
+            {
+                RequireSingle(result, HashPrefix.TransactionSig, result["SigningPubKey"]?.GetValue<string>(), mainSignature,
+                    "the transaction's own signature");
+            }
+
+            foreach (JsonNode? entry in result["Signers"] as JsonArray ?? new JsonArray())
+                RequireEntry(result, entry, HashPrefix.TransactionMultiSig, "Signers");
+
+            foreach (InnerSection section in sections)
+            {
+                if (result[section.Field] is not JsonObject inner)
+                    continue;
+
+                if (inner["Signers"] is JsonArray entries)
+                {
+                    foreach (JsonNode? entry in entries)
+                        RequireEntry(result, entry, CoSigningEngine.PrefixFor(section.Field, multiSigning: true), $"{section.Field}.Signers");
+                }
+                else if (inner["TxnSignature"]?.GetValue<string>() is { Length: > 0 } coSignature)
+                {
+                    RequireSingle(result, CoSigningEngine.PrefixFor(section.Field), inner["SigningPubKey"]?.GetValue<string>(), coSignature, section.Field);
+                }
+            }
+        }
+
+        private static void RequireSingle(JsonObject result, HashPrefix prefix, string? publicKey, string signature, string what)
+        {
+            if (string.IsNullOrEmpty(publicKey))
+                throw new ValidationException($"{what} carries a signature with no SigningPubKey.");
+
+            byte[] preimage = AddressCodec.Utils.FromHex(XrplBinaryCodec.EncodeForSigning(result, prefix));
+            if (!XrplKeypairs.Verify(preimage, signature, publicKey))
+                throw new ValidationException(
+                    $"{what} does not verify over the composed transaction. It was signed over different bytes - a different transaction body, a different SigningPubKey, or another signing role.");
+        }
+
+        private static void RequireEntry(JsonObject result, JsonNode? entry, HashPrefix prefix, string section)
+        {
+            JsonObject signer = entry?["Signer"]?.AsObject()
+                ?? throw new ValidationException($"A {section} entry is missing its Signer object.");
+            string account = signer["Account"]?.GetValue<string>()
+                ?? throw new ValidationException($"A {section} entry is missing the Account field.");
+            string? publicKey = signer["SigningPubKey"]?.GetValue<string>();
+            string signature = signer["TxnSignature"]?.GetValue<string>()
+                ?? throw new ValidationException($"The {section} entry of {account} is missing its TxnSignature.");
+
+            if (string.IsNullOrEmpty(publicKey))
+                throw new ValidationException($"The {section} entry of {account} carries no SigningPubKey.");
+
+            byte[] preimage = AddressCodec.Utils.FromHex(XrplBinaryCodec.EncodeForMultiSigning(result, account, prefix));
+            if (!XrplKeypairs.Verify(preimage, signature, publicKey))
+                throw new ValidationException(
+                    $"The {section} entry of {account} does not verify over the composed transaction. " +
+                    "A multi-signature entry covers the section it belongs to, so an entry signed for one side cannot be routed into another; " +
+                    "where the transaction does not say which side, pass the role to Sign.");
         }
 
         /// <summary>

@@ -46,6 +46,31 @@ public enum VaultVersion : uint
 }
 
 /// <summary>
+/// Values of the <c>VaultKind</c> field (rippled <c>VaultKind</c>, LendingProtocolV1_1, rippled #7921).
+/// </summary>
+/// <remarks>
+/// <see cref="LOVault.VaultKind"/> and <see cref="Xrpl.Models.Transactions.VaultCreate.VaultKind"/> stay
+/// plain <c>uint?</c>, matching the other UInt8 fields; these constants name the values the protocol
+/// defines so far.
+/// </remarks>
+public enum VaultKind : uint
+{
+    /// <summary>
+    /// Deposits and withdrawals at any time. A vault with no VaultKind at all is open-ended, whether it
+    /// was created before the amendment or after it.
+    /// </summary>
+    OpenEnded = 0,
+
+    /// <summary>
+    /// Three phases fixed at creation: subscription up to <see cref="LOVault.SubscriptionDate"/>,
+    /// investment up to <see cref="LOVault.RedemptionDate"/>, redemption afterwards. Deposits are
+    /// accepted in the subscription phase only (tecEXPIRED later); withdrawals are refused during
+    /// the investment phase (tecTOO_SOON) and accepted in the other two.
+    /// </summary>
+    ClosedEnded = 1,
+}
+
+/// <summary>
 /// Recommended structure for the Vault Data field.
 /// The JSON is whitespace-removed and hex-encoded (max 256 bytes).
 /// </summary>
@@ -187,6 +212,28 @@ public class LOVault : BaseLedgerEntry
     /// </summary>
     [JsonPropertyName("LEVersion")]
     public uint? LEVersion { get; init; }
+
+    /// <summary>
+    /// LendingProtocolV1_1: the kind of vault (UInt8), see <see cref="Xrpl.Models.Ledger.VaultKind"/>.
+    /// Absent on open-ended vaults, which rippled resolves as
+    /// <see cref="Xrpl.Models.Ledger.VaultKind.OpenEnded"/> (0).
+    /// </summary>
+    [JsonPropertyName("VaultKind")]
+    public uint? VaultKind { get; init; }
+
+    /// <summary>
+    /// LendingProtocolV1_1: the end of a closed-ended vault's subscription phase. Absent on open-ended vaults.
+    /// </summary>
+    [JsonPropertyName("SubscriptionDate")]
+    [JsonConverter(typeof(RippleDateTimeConverter))]
+    public DateTime? SubscriptionDate { get; init; }
+
+    /// <summary>
+    /// LendingProtocolV1_1: the start of a closed-ended vault's redemption phase. Absent on open-ended vaults.
+    /// </summary>
+    [JsonPropertyName("RedemptionDate")]
+    [JsonConverter(typeof(RippleDateTimeConverter))]
+    public DateTime? RedemptionDate { get; init; }
 
     /// <summary>
     /// Arbitrary hex-encoded data associated with the vault, limited to 256 bytes.
