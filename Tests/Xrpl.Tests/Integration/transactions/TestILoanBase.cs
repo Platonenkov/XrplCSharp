@@ -73,10 +73,10 @@ public abstract class TestILoanBase
     #region Closed-ended vaults (LendingProtocolV1_1)
 
     /// <summary>
-    /// How much of the subscription phase is left once the vault exists. It has to cover the
-    /// VaultCreate itself and the deposit that follows: rippled accepts a vault deposit in the
-    /// subscription phase only - <c>tecEXPIRED</c> afterwards - and each of the two waits for a
-    /// ledger of its own.
+    /// How much subscription phase to buy, counted from the close time read while the VaultCreate
+    /// is still being built. It has to cover that read, the create, and the deposit that follows:
+    /// rippled accepts a vault deposit in the subscription phase only - <c>tecEXPIRED</c>
+    /// afterwards - and each of the two transactions waits for a ledger of its own.
     /// </summary>
     private const int SubscriptionWindowSeconds = 30;
 
@@ -102,7 +102,12 @@ public abstract class TestILoanBase
     /// </summary>
     protected static async Task<bool> ClosedEndedVaultRequiredAsync(IXrplClient client)
     {
-        closedEndedRequired ??= await AmendmentGuard.IsEnabledAsync(client, AmendmentGuard.LendingProtocolV11);
+        // Only a yes is remembered: a node that refused the question answers the same false as a
+        // node without the amendment, and caching that would send every later broker to the
+        // open-ended path the amendment refuses, one transient error turning into a red suite.
+        if (closedEndedRequired != true)
+            closedEndedRequired = await AmendmentGuard.IsEnabledAsync(client, AmendmentGuard.LendingProtocolV11);
+
         return closedEndedRequired.Value;
     }
 
@@ -141,10 +146,28 @@ public abstract class TestILoanBase
     protected static async Task EnterInvestmentPhaseAsync(IXrplClient client, string vaultId)
     {
         LedgerEntryResponse entry = await client.LedgerEntry(new LedgerEntryRequest { Index = vaultId }).Typed();
-        if (entry?.Node is not LOVault vault || vault.SubscriptionDate is not DateTime subscriptionDate)
+        if (entry?.Node is not LOVault vault)
+            throw new RippleException($"ledger_entry for vault {vaultId} did not come back as a Vault: {entry?.Node?.GetType().Name ?? "nothing"}");
+
+        // No SubscriptionDate is an open-ended vault, which has no phases to wait for
+        if (vault.SubscriptionDate is not DateTime subscriptionDate)
             return;
 
         await IntegrationTestConfig.WaitForCloseTimeAsync(client, subscriptionDate, nodeType);
+
+        // Past the start of the phase is not the same as inside it. Landing past the redemption
+        // date instead would make the LoanSet that follows fail with tecEXPIRED, which reads as a
+        // protocol refusal rather than as this wait having missed its window.
+        if (vault.RedemptionDate is DateTime redemptionDate)
+        {
+            DateTime now = await IntegrationTestConfig.ValidatedCloseTimeAsync(client);
+            if (now >= redemptionDate)
+            {
+                throw new RippleException(
+                    $"vault {vaultId} reached its redemption phase before a loan could be originated: " +
+                    $"close time {now:O}, redemption {redemptionDate:O}. The investment window was too short for this run.");
+            }
+        }
     }
 
     #endregion

@@ -195,14 +195,13 @@ jobs:
           out=$(dotnet run --project Tools/GenerateEnums -- diff http://localhost:5005 2>&1)
           status=$?
           echo "$out"
-          # 0 is in sync and 1 is drift; anything else is the tool failing to answer at all,
-          # and an empty grep would then reach the PR body as "no differences reported".
-          # What goes into the output stays text this file chose: the PR-body step pastes it
-          # into its own shell source, where a quote from a stack trace ends the string and a
-          # $(...) in it runs. The tool's own output is above, in this step's log.
-          if [ "$status" -eq 0 ] || [ "$status" -eq 1 ]; then
+          # The verdict is the tool's own Summary line, not the exit code: `dotnet run` answers 1
+          # both for drift and for a build that never produced a diff, and reading the code alone
+          # would report the second as "no differences" - the reassuring answer for the one case
+          # that has no answer. No Summary line means the tool did not get that far.
+          verdict=$(printf '%s\n' "$out" | grep -E '^Summary')
+          if [ -n "$verdict" ]; then
             summary=$(printf '%s\n' "$out" | grep -E 'node-only|mismatch|^Summary')
-            [ -n "$summary" ] || summary='no differences reported'
           else
             summary=$(printf 'the definitions diff did not run (exit %s), so this section says nothing about drift; the step log above has the output' "$status")
           fi
@@ -227,6 +226,13 @@ jobs:
           NEW_REF: ${{ steps.check.outputs.new_ref }}
           AGE_DAYS: ${{ steps.check.outputs.age_days }}
           BRANCH: ${{ steps.decide.outputs.branch }}
+          # Through the environment rather than a ${{ }} in the script below: an expression is
+          # pasted into the shell source before bash sees it, so a quote in the value ends the
+          # string and a $(...) in it runs. AMENDMENTS_* hold generated names and DEFINITIONS_SUMMARY
+          # carries field names the node chose, which is not text this file gets to vouch for.
+          AMENDMENTS_ADDED: ${{ steps.bump.outputs.added }}
+          AMENDMENTS_REMOVED: ${{ steps.bump.outputs.removed }}
+          DEFINITIONS_SUMMARY: ${{ steps.definitions.outputs.summary }}
         run: |
           set -euo pipefail
           git config user.name "${{ github.actor }}"
@@ -242,10 +248,10 @@ jobs:
             printf -- '- `.ci-config/Dockerfile.nightly`: `%s` -> `%s`\n' "$OLD_VERSION" "$NEW_VERSION"
             printf -- '- `.ci-config/rippled.batchv11.cfg`: `[features]`/`[amendments]` regenerated from develop `%s`, the commit that build was made from\n\n' "$NEW_REF"
             printf '## Amendment changes\n\n'
-            printf 'Added:\n```\n%s\n```\n\n' "${{ steps.bump.outputs.added }}"
-            printf 'Removed:\n```\n%s\n```\n\n' "${{ steps.bump.outputs.removed }}"
+            printf 'Added:\n```\n%s\n```\n\n' "$AMENDMENTS_ADDED"
+            printf 'Removed:\n```\n%s\n```\n\n' "$AMENDMENTS_REMOVED"
             printf '## definitions.json vs the new build\n\n'
-            printf '```\n%s\n```\n\n' "${{ steps.definitions.outputs.summary }}"
+            printf '```\n%s\n```\n\n' "$DEFINITIONS_SUMMARY"
             printf 'A `node-only` field here means the SDK is behind develop and needs a follow-up; `local-only` entries are informational.\n\n'
             printf '## Verification\n\n'
             printf 'The stand was built and started from the new pin on the runner, and the AMM sentinel amendment came up enabled at genesis, so the regenerated config was accepted.\n\n'

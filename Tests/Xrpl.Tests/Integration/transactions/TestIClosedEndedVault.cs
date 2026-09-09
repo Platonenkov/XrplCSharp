@@ -103,8 +103,15 @@ public class TestIClosedEndedVault : TestIVaultBase
         // Subscription phase: deposits are accepted
         ValidateResult(await SubmitAsync(Deposit(wallet, vaultId), wallet));
 
-        // Investment phase: neither deposits nor withdrawals
+        // Investment phase: neither deposits nor withdrawals. Past the subscription date is not
+        // the same as inside the phase - overshooting into redemption would let the withdrawal
+        // through and report it as the assertion failing, so the position is checked, not assumed.
         await IntegrationTestConfig.WaitForCloseTimeAsync(client, subscriptionDate, nodeType);
+        DateTime investmentNow = await IntegrationTestConfig.ValidatedCloseTimeAsync(client);
+        Assert.IsTrue(
+            investmentNow < redemptionDate,
+            $"the investment phase was missed: close time {investmentNow:O} is already at or past the redemption date {redemptionDate:O}");
+
         await AssertResultAsync("tecEXPIRED", () => SubmitAsync(Deposit(wallet, vaultId), wallet));
         await AssertResultAsync("tecTOO_SOON", () => SubmitAsync(Withdraw(wallet, vaultId), wallet));
 

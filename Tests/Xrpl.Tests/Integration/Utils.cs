@@ -473,6 +473,9 @@ namespace XrplTests.Xrpl.ClientLib.Integration
         /// Bounded, because a ledger that stops advancing is a node failure, and a test that waits
         /// on it forever reports nothing. The failure names the last close time seen and how far
         /// short of the mark it was, which separates a stalled node from a mark set too far ahead.
+        /// The budget is checked between requests, so a node that answers slowly can overshoot it
+        /// by one request; a node that stops answering ends the wait through the client's own
+        /// RequestTimeout instead, and with its exception rather than this diagnostic.
         /// </para>
         /// </remarks>
         public static async Task WaitForCloseTimeAsync(

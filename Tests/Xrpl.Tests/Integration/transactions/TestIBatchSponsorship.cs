@@ -52,7 +52,6 @@ public class TestIBatchSponsorship
         }
 
         await AmendmentGuard.RequireRoleSignaturesAsync(client);
-        
     }
 
     [ClassCleanup]

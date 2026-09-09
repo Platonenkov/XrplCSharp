@@ -84,7 +84,12 @@ public static class AmendmentGuard
     /// </remarks>
     public static async Task RequireRoleSignaturesAsync(IXrplClient client)
     {
-        roleSignatures ??= await IsEnabledAsync(client, FixCleanup340);
+        // Only a yes is remembered. IsEnabledAsync answers false both for "the node does not have
+        // it" and for "the node refused the question", and caching the second would turn one
+        // transient error into a whole run reported as skipped.
+        if (roleSignatures != true)
+            roleSignatures = await IsEnabledAsync(client, FixCleanup340);
+
         if (roleSignatures != true)
             Assert.Inconclusive("The node verifies a role signature the pre-fixCleanup3_4_0 way, over the transaction's own prefix; the SDK signs under the role prefix the amendment introduced. Run these on a stand carrying fixCleanup3_4_0 (.ci-config/docker-compose.batchv11.yml) or on devnet.");
     }
